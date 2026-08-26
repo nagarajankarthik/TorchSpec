@@ -109,7 +109,6 @@ class SpeedMonitor:
         return self._total_count
 
 
-@ray.remote
 class AsyncTrainingController:
     """Central controller for async training pipeline.
 

@@ -146,7 +146,7 @@ def init_engines(args, pg, engine_type: str, mooncake_config=None, engine_group:
     elif engine_type == "sgl":
         return _init_sgl_engines(args, pg, mooncake_config, engine_group)
     elif engine_type == "vllm":
-        return _init_vllm_engines(args, pg, mooncake_config, engine_group)
+        return _init_vllm_engines(args, mooncake_config, engine_group)
     elif engine_type == "trtllm":
         return _init_trtllm_engines(args, pg, mooncake_config, engine_group)
     elif engine_type == "tokenspeed":

@@ -350,12 +350,9 @@ def train_async_no_generation(args):
 
     # [1] Create controller early (lightweight: only needs args + dp_size)
     with timer.phase("Create controller"):
-        driver_node_id = ray.get_runtime_context().get_node_id()
-        controller = AsyncTrainingController.options(
-            runtime_env={"env_vars": get_torchspec_env_vars()},
-            scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=driver_node_id, soft=False),
-        ).remote(args, args.dp_size)
+        controller = AsyncTrainingController(args, args.dp_size)
 
+    # TODO: Remove this. It should live on the trainer side.
     # [1.5] Parse draft config + DFlash validation (before any async work)
     with timer.phase("Parse draft model config"):
         draft_model_config = _get_draft_model_config(args)
@@ -363,27 +360,30 @@ def train_async_no_generation(args):
 
         _validate_and_configure_dflash(args, draft_model_config)
 
-    # [2] Kick off dataset loading on controller (async — runs on actor while driver continues)
+    # [2] Kick off dataset loading on controller
+    # The original design used Ray to locate the controller in a separate process
+    # but that is no longer the case here. There may be some performance impact.
     timer.begin_async("Dataset loading")
-    dataset_size_ref = controller.load_dataset.remote(args)
-    eval_dataset_size_ref = controller.load_eval_dataset.remote(args)
+    dataset_size_ref = controller.load_dataset(args)
+    eval_dataset_size_ref = controller.load_eval_dataset(args)
 
-    # [3] Do initialization that doesn't depend on dataset in parallel
+    # [3] Wait for dataset sizes (small ints, unlike the old ray.put of the full dataset)
+    dataset_size, eval_dataset_size = timer.wait(
+        "Dataset loading", [dataset_size_ref, eval_dataset_size_ref]
+    )
+    logger.info(f"Dataset loaded on controller: {dataset_size} train, {eval_dataset_size} eval")
+
+    # [4] Continue with initialization sequentially.
     with timer.phase("Driver-side init"):
         roles = (
             {"training"}
             if getattr(args, "inference_engine_type", None) == "offline"
             else {"training", "inference"}
         )
-        pgs = create_placement_groups(args, roles=roles)
+        # pgs = create_placement_groups(args, roles=roles)
         launch_mooncake_master(args)
         mooncake_config = build_mooncake_config(args)
 
-    # [4] Wait for dataset sizes (small ints, unlike the old ray.put of the full dataset)
-    dataset_size, eval_dataset_size = timer.wait(
-        "Dataset loading", [dataset_size_ref, eval_dataset_size_ref]
-    )
-    logger.info(f"Dataset loaded on controller: {dataset_size} train, {eval_dataset_size} eval")
 
     # [5] Auto-calculate training steps (needs dataset_size)
     with timer.phase("Auto-calculate training steps"):
@@ -414,9 +414,7 @@ def train_async_no_generation(args):
                     f"Computing vocab mapping on controller "
                     f"(target={vocab_size}, draft={draft_vocab_size})..."
                 )
-                vocab_mapping = ray.get(
-                    controller.compute_vocab_mapping.remote(vocab_size, draft_vocab_size)
-                )
+                vocab_mapping = controller.compute_vocab_mapping(vocab_size, draft_vocab_size)
             if vocab_mapping is not None:
                 logger.info(
                     f"Generated vocab mapping: "

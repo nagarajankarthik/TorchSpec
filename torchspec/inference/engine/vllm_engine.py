@@ -19,7 +19,7 @@
 # THE SOFTWARE.
 
 """
-VLLM Ray actor engine for distributed deployment.
+VLLM engines for distributed deployment.
 
 Uses vLLM's ``extract_hidden_states`` speculative decoding method with a
 custom ``MooncakeHiddenStatesConnector`` KV Connector to capture intermediate
@@ -37,12 +37,10 @@ import socket
 import threading
 from typing import Any
 
-import ray
 import torch
 from omegaconf import DictConfig, OmegaConf
 
 from torchspec.inference.engine.base import InferenceEngine
-from torchspec.ray.ray_actor import RayActor
 from torchspec.utils.logging import logger, setup_file_logging
 from torchspec.utils.misc import get_default_eagle3_aux_layer_ids
 
@@ -80,8 +78,8 @@ _PER_STAGE_AUX_CAPTURE_ARCHITECTURES = frozenset(
 )
 
 
-class VllmEngine(InferenceEngine, RayActor):
-    """Ray actor wrapper for vLLM LLM engine with distributed deployment support.
+class VllmEngine(InferenceEngine):
+    """Setup and manage vLLM LLM engine with distributed deployment support.
 
     Uses vLLM's ``extract_hidden_states`` speculative method with a
     ``MooncakeHiddenStatesConnector`` to capture hidden states from selected
@@ -498,7 +496,7 @@ class VllmEngine(InferenceEngine, RayActor):
     def generate(
         self,
         data_id: str | list[str],
-        input_ids_ref: ray.ObjectRef | list[torch.Tensor] | None = None,
+        input_ids_ref: list[torch.Tensor] | None = None,
         packed_loss_mask_list: list[str | None] | None = None,
         formatted_prompts: list[str] | None = None,
         return_last_hidden_states: bool = False,
@@ -524,10 +522,7 @@ class VllmEngine(InferenceEngine, RayActor):
         if use_prompts:
             batch_size = len(formatted_prompts)
         else:
-            if isinstance(input_ids_ref, ray.ObjectRef):
-                input_ids_list = ray.get(input_ids_ref)
-            else:
-                input_ids_list = input_ids_ref
+            input_ids_list = input_ids_ref
             if input_ids_list is None:
                 raise ValueError("input_ids_ref resolved to None")
             batch_size = len(input_ids_list)
