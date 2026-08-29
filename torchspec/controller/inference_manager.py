@@ -43,8 +43,6 @@ import time
 from collections import deque
 from typing import Any
 
-import ray
-from ray.exceptions import RayActorError
 
 from torchspec.utils.logging import logger
 from torchspec.utils.types import InferenceInput, InferenceOutput
@@ -127,7 +125,201 @@ class MetricsCollector:
         return metrics
 
 
-@ray.remote
+class VLLMClient:
+    """
+    Minimal async client against vLLM's completions API, id-in/id-out.
+
+    Performs the role of the inference engine class in the original TorchSpec code.
+
+    """
+
+    def __init__(self, urls: list[str], timeout_s: float):
+        if not urls:
+            raise ValueError("urls must be non-empty")
+        self.urls = urls
+        self._rr = 0
+        self._timeout = aiohttp.ClientTimeout(total=timeout_s)
+        self._session: Optional[aiohttp.ClientSession] = None
+
+    async def init(self):
+        self._session = aiohttp.ClientSession(timeout=self._timeout)
+
+    async def shutdown(self):
+        if self._session:
+            await self._session.close()
+
+    def _next_url(self) -> str:
+        url = self.urls[self._rr % len(self.urls)]
+        self._rr += 1
+        return url
+
+    def _normalize_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if input_ids.dim() == 2 and input_ids.shape[0] == 1:
+            return input_ids.squeeze(0)
+        if input_ids.dim() == 1:
+            return input_ids
+        raise ValueError(f"Unexpected input_ids shape: {input_ids.shape}")
+
+    def _build_prompts(
+            self,
+            formatted_prompts: list[str] | None,
+            input_ids_list: list[torch.Tensor] | None,
+            multimodal_inputs: list[dict | None] | None,
+            batch_size: int,
+        ) -> list:
+            """Assemble per-request vLLM prompt dicts, attaching multimodal data when present."""
+
+            if multimodal_inputs is not None:
+                raise NotImplementedError, "Multimodal inputs not yet supported"
+
+            prompts: list = []
+            for i in range(batch_size):
+                if formatted_prompts is not None:
+                    prompt_dict: dict = {"prompt": formatted_prompts[i]}
+                else:
+                    prompt_dict = {
+                        "prompt_token_ids": self._normalize_input_ids(input_ids_list[i]).tolist()
+                    }
+
+                prompts.append(prompt_dict)
+            return prompts
+
+    
+    async def generate(
+            self,
+            data_id: str | list[str],
+            input_ids_ref: list[torch.Tensor] | None = None,
+            packed_loss_mask_list: list[str | None] | None = None,
+            formatted_prompts: list[str] | None = None,
+            return_last_hidden_states: bool = False,
+            return_logits: bool = True,
+            multimodal_inputs: list[dict] | None = None,
+        ) -> list[dict]:
+            """Generate hidden states for training data.
+
+            Hidden states are captured by vLLM's ``extract_hidden_states``
+            speculative method and stored to Mooncake by the
+            ``MooncakeHiddenStatesConnector``.  Metadata comes back in
+            ``output.kv_transfer_params``.
+            """
+            if self._session is None:
+                raise RuntimeError("VLLMClient not initialized. Call init() first.")
+
+            if (input_ids_ref is None) == (formatted_prompts is None):
+                raise ValueError("Exactly one of input_ids_ref or formatted_prompts must be set")
+
+            use_prompts = formatted_prompts is not None
+            input_ids_list: list[torch.Tensor] | None = None
+
+            if use_prompts:
+                batch_size = len(formatted_prompts)
+            else:
+                input_ids_list = input_ids_ref
+                if input_ids_list is None:
+                    raise ValueError("input_ids_ref resolved to None")
+                batch_size = len(input_ids_list)
+
+            prompts = self._build_prompts(
+                formatted_prompts=formatted_prompts if use_prompts else None,
+                input_ids_list=input_ids_list,
+                multimodal_inputs=multimodal_inputs,
+                batch_size=batch_size,
+            )
+
+            if isinstance(data_id, str):
+                data_ids = [f"{data_id}_{i}" for i in range(batch_size)]
+            elif len(data_id) == batch_size:
+                data_ids = data_id
+            else:
+                raise ValueError(
+                    f"data_id length {len(data_id)} does not match batch size {batch_size}"
+                )
+
+            sampling_params = {
+                    "max_tokens": 1,
+                    "temperature": 0,
+                    }
+
+            # Build packed_loss_mask_map for result assembly
+            packed_loss_mask_map: dict[str, str | None] = {}
+            if packed_loss_mask_list is not None:
+                for i, did in enumerate(data_ids):
+                    if i < len(packed_loss_mask_list):
+                        packed_loss_mask_map[did] = packed_loss_mask_list[i]
+
+            outputs = await self._infer(prompts, **sampling_params, use_tqdm=False)
+
+            results = []
+            for i, output in enumerate(outputs):
+                seq_len = len(output.prompt_token_ids)
+                did = data_ids[i]
+
+                kv_params = getattr(output, "kv_transfer_params", None)
+                if kv_params is None:
+                    logger.error(
+                        f"VllmEngine rank {self.rank}: No kv_transfer_params for data_id={did}. "
+                        f"The MooncakeHiddenStatesConnector may not have stored this request."
+                    )
+                    continue
+
+                mooncake_key = kv_params.get("mooncake_key", did)
+                tensor_shapes = kv_params.get("tensor_shapes", {})
+                tensor_dtypes = kv_params.get("tensor_dtypes", {})
+
+                result: dict[str, Any] = {
+                    "mooncake_key": mooncake_key,
+                    "tensor_shapes": tensor_shapes,
+                    "tensor_dtypes": tensor_dtypes,
+                    "data_id": did,
+                    "seq_len": seq_len,
+                }
+                pp_layer_manifest = kv_params.get("pp_layer_manifest")
+                if pp_layer_manifest is not None:
+                    result["metadata"] = {
+                        "vllm_pp_complete": True,
+                        "vllm_pp_layer_manifest": pp_layer_manifest,
+                    }
+
+                packed_loss_mask = packed_loss_mask_map.get(did)
+                if packed_loss_mask is not None:
+                    result["packed_loss_mask"] = packed_loss_mask
+
+                input_ids_from_kv = kv_params.get("input_ids_list")
+                if input_ids_from_kv is not None:
+                    result["input_ids_list"] = input_ids_from_kv
+                else:
+                    result["input_ids_list"] = list(output.prompt_token_ids)
+
+                results.append(result)
+
+            logger.debug(
+                f"VllmEngine rank {self.rank}: generated {len(results)} mooncake results "
+                f"for data_ids={data_ids}"
+            )
+            return results
+
+    async def _infer(self, prompt_ids: list[int], *, max_tokens: int,
+                       temperature: float = 0.0, top_p: float = 1.0,
+                       seed: Optional[int] = None,
+                       extra_body: Optional[dict] = None) -> dict:
+        payload = {
+            "prompt": prompt_ids,               # token-id prompts
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "return_token_ids": True,           # need ids back, not text
+        }
+        if seed is not None:
+            payload["seed"] = seed
+        if extra_body:
+            payload.update(extra_body)
+        async with self._session.post(
+            f"{self._next_url()}/v1/completions", json=payload
+        ) as resp:
+            resp.raise_for_status()
+            return await resp.json()
+
+
 class AsyncInferenceManager:
     """Dispatches inference batches to distributed Ray engine actors.
 
@@ -155,13 +347,14 @@ class AsyncInferenceManager:
         self,
         args,
         controller,
-        inference_engines: list | None = None,
-        max_concurrent_batches: int = 1,
     ):
         self.args = args
         self.controller = controller
 
-        self._engines = EnginePool(inference_engines or [], max_concurrent_batches)
+        vllm_endpoints = getattr(args, "vllm_endpoints", [])
+        vllm_timeouts_s = getattr(args, "vllm_timeouts_s", 10.0)
+        max_concurrent = getattr(args, "max_concurrent_batches", 1)
+        self._vllm_client = VllmClient(vllm_endpoints, vllm_timeout_s)
         self._metrics = MetricsCollector()
 
         self._prompt_buffer: deque[InferenceInput] = deque()
@@ -194,11 +387,9 @@ class AsyncInferenceManager:
 
     async def run(self) -> None:
         """Main loop: refill runs in background, dispatch → collect in foreground."""
-        logger.info(
-            f"AsyncInferenceManager starting ({len(self._engines)} engines, "
-            f"max_concurrent={self._engines.max_concurrent})"
-        )
 
+        logger.info("AsyncInferenceManager started")
+        self._vllm_client.init()
         refill_task = asyncio.create_task(self._continuous_refill())
 
         while self._running:
@@ -427,7 +618,7 @@ class AsyncInferenceManager:
             )
             formatted_prompts = [e.formatted_prompt for e in entries]
         else:
-            input_ids_ref = ray.put([e.input_ids for e in entries])
+            input_ids_ref = [e.input_ids for e in entries]
             formatted_prompts = None
 
         return {
@@ -443,47 +634,37 @@ class AsyncInferenceManager:
     async def _dispatch_batch(
         self, entries: list[InferenceInput]
     ) -> list[tuple[InferenceInput, dict | Exception]]:
-        """Send a batch to the next engine and return (entry, output) pairs."""
-        async with self._engines.semaphore:
-            kwargs = self._prepare_engine_inputs(entries)
-            engine = self._engines.pick()
+        """Send a batch to the vllm endpoint and return (entry, output) pairs."""
+        kwargs = self._prepare_engine_inputs(entries)
 
-            try:
-                if self._enable_perf_metrics:
-                    t0 = time.time()
-                generate_method = (
-                    engine.generate_with_decode if self._train_with_decode else engine.generate
+        try:
+            if self._enable_perf_metrics:
+                t0 = time.time()
+            outputs = await self._vllm_client.generate(
+                data_id=kwargs["data_ids"],
+                input_ids_ref=kwargs["input_ids_ref"],
+                packed_loss_mask_list=kwargs["packed_loss_mask_list"],
+                formatted_prompts=kwargs["formatted_prompts"],
+                return_last_hidden_states=kwargs["return_last_hidden_states"],
+                return_logits=kwargs["return_logits"],
+                multimodal_inputs=kwargs["multimodal_inputs"],
+            )
+            if self._enable_perf_metrics:
+                now = time.time()
+                self._batch_times.append((len(entries), now - t0, now))
+            if len(outputs) != len(entries):
+                logger.error(
+                    f"Engine returned {len(outputs)} results for "
+                    f"{len(entries)} entries (expected equal)"
                 )
-                outputs = await generate_method.remote(
-                    data_id=kwargs["data_ids"],
-                    input_ids_ref=kwargs["input_ids_ref"],
-                    packed_loss_mask_list=kwargs["packed_loss_mask_list"],
-                    formatted_prompts=kwargs["formatted_prompts"],
-                    return_last_hidden_states=kwargs["return_last_hidden_states"],
-                    return_logits=kwargs["return_logits"],
-                    multimodal_inputs=kwargs["multimodal_inputs"],
-                )
-                if self._enable_perf_metrics:
-                    now = time.time()
-                    self._batch_times.append((len(entries), now - t0, now))
-                if len(outputs) != len(entries):
-                    logger.error(
-                        f"Engine returned {len(outputs)} results for "
-                        f"{len(entries)} entries (expected equal)"
-                    )
-                    err = ValueError(f"output count mismatch: {len(outputs)} vs {len(entries)}")
-                    return [(entry, err) for entry in entries]
-                return list(zip(entries, outputs, strict=True))
-            except RayActorError as e:
-                logger.critical(f"Engine actor died, terminating inference manager: {e}")
-                self._running = False
-                await self.controller.set_inference_error.remote(str(e))
-                raise
-            except Exception as e:
-                import traceback
+                err = ValueError(f"output count mismatch: {len(outputs)} vs {len(entries)}")
+                return [(entry, err) for entry in entries]
+            return list(zip(entries, outputs, strict=True))
+        except Exception as e:
+            import traceback
 
-                logger.error(f"Engine dispatch failed: {e}\n{traceback.format_exc()}")
-                return [(entry, e) for entry in entries]
+            logger.error(f"Engine dispatch failed: {e}\n{traceback.format_exc()}")
+            return [(entry, e) for entry in entries]
 
     # -- Result processing ---------------------------------------------------
 
@@ -522,7 +703,7 @@ class AsyncInferenceManager:
                 inference_results.append(inference_result)
 
         if inference_results:
-            await self.controller.push_inference_results.remote(inference_results)
+            await self.controller.push_inference_results(inference_results)
             logger.debug(f"Forwarded {len(inference_results)} results to controller")
 
         return len(inference_results)

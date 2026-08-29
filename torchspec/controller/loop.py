@@ -126,12 +126,12 @@ def _cleanup_old_checkpoints(checkpoint_dir: str | None, max_checkpoints: int) -
 
 
 def _safe_training_cleanup(
-    args, inference_manager, inference_future, inference_engines=None
+    args, inference_manager, mooncake_master = None,inference_future = None, inference_engines=None
 ) -> None:
     """Best-effort teardown for inference manager and mooncake master actor."""
     if inference_manager is not None:
         try:
-            ray.get(inference_manager.stop.remote())
+            inference_manager.stop()
         except Exception as exc:
             logger.warning(f"Failed to stop inference manager: {exc}")
         if inference_future is not None:
@@ -156,24 +156,23 @@ def _safe_training_cleanup(
             except Exception as exc:
                 logger.warning(f"Engine shutdown timed out or failed: {exc}")
 
-    mooncake_master_actor = getattr(args, "_mooncake_master_actor", None)
-    if mooncake_master_actor is not None:
+    if mooncake_master is not None:
         try:
-            ray.get(mooncake_master_actor.shutdown.remote(), timeout=10)
+            mooncake_master.shutdown()
         except Exception as exc:
-            logger.warning(f"Failed to shutdown mooncake master actor: {exc}")
+            logger.warning(f"Failed to shutdown mooncake master: {exc}")
 
 
 def training_loop(
     args,
     controller,
     inference_manager,
-    train_group,
-    inference_engines=None,
     dataset_size=None,
     eval_dataset_size=None,
 ):
     """Run the training loop with sync training and async inference.
+
+    Evaluation is temporarily disabled for now.
 
     Training is synchronous - waits for each step to complete.
     Inference runs in background, continuously producing data.
@@ -195,25 +194,12 @@ def training_loop(
         eval_dataset_size: Number of eval samples. If None, queried from controller. 0 means no eval.
     """
     if dataset_size is None:
-        dataset_size = ray.get(controller.get_dataset_size.remote())
+        dataset_size = controller.get_dataset_size()
     if dataset_size <= 0:
         raise ValueError(
             f"Training dataset size is {dataset_size}. "
             f"Ensure controller.load_dataset() was called before run_training_loop()."
         )
-    if eval_dataset_size is None:
-        eval_dataset_size = ray.get(controller.get_eval_dataset_size.remote())
-
-    # ── Eval setup ──────────────────────────────────────────────
-    eval_state = setup_eval(controller, train_group, args, eval_dataset_size)
-
-    # Inference engine is alive. Run eval hs generation first.
-    if eval_state.eval_enabled and not eval_state.eval_cache_loaded:
-        generate_eval_cache(controller, train_group, eval_state)
-
-    eval_interval = eval_state.eval_interval
-    eval_enabled = eval_state.eval_enabled
-    best_eval_score = eval_state.best_eval_score
 
     dp_size = (
         getattr(args, "dp_size", None) or args.training_num_nodes * args.training_num_gpus_per_node
@@ -230,10 +216,10 @@ def training_loop(
     # leak into the inference pipeline during eval.
     # Resume is best-effort: completed optimizer steps determine epoch/skip, but
     # async prompt/result buffers can still lose or replay a small tail.
-    start_step = ray.get(train_group._actor_handlers[0].get_global_step.remote())
+    start_step = getattr(args, "resume_from_step", 0)
     resume_epoch = start_step // steps_per_epoch if steps_per_epoch > 0 else 0
     resume_skip = (start_step % steps_per_epoch) * args.global_batch_size if start_step > 0 else 0
-    ray.get(controller.submit_training_dataset.remote(epoch=resume_epoch, skip=resume_skip))
+    controller.submit_training_dataset(epoch=resume_epoch, skip=resume_skip)
 
     logger.info(
         f"Starting: num_steps={num_steps}, num_epochs={num_epochs}, "
@@ -270,8 +256,7 @@ def training_loop(
         status = None
         while queued_batches < target_queued_batches:
             dispatch_attempts += 1
-
-            dispatched = ray.get(controller.try_dispatch_batch.remote())
+            dispatched = controller.try_dispatch_batch()
             if dispatched:
                 queued_batches += 1
                 consecutive_failures = 0
@@ -285,7 +270,7 @@ def training_loop(
 
                 # Only fetch status when needed for logging or reload decision
                 if dispatch_attempts % 100 == 0 or consecutive_failures >= 500:
-                    status = ray.get(controller.get_full_status.remote())
+                    status = controller.get_full_status()
 
                 if dispatch_attempts % 100 == 0 and status is not None:
                     logger.debug(
@@ -336,36 +321,18 @@ def training_loop(
             # Inner while broke (max steps reached during reload), break outer loop
         break
 
-    final_train_results = train_group.flush_pending_train_metrics()
-    if not isinstance(final_train_results, (list, tuple)):
-        final_train_results = []
-    final_metrics = final_train_results[0] if final_train_results and final_train_results[0] else {}
-    if final_metrics:
-        final_metric_step = int(final_metrics.pop("_metrics_step", completed_steps))
-        final_metrics["train/step"] = final_metric_step
-        final_metrics["inference/step"] = completed_steps
-        if enable_perf and previous_dispatch_wait is not None:
-            final_metrics["perf/dispatch_wait"] = previous_dispatch_wait
-            step_time = final_metrics.get("perf/step_time", 0)
-            if step_time > 0:
-                final_metrics["perf/train_capacity"] = args.global_batch_size / step_time
-        _write_training_metrics(final_metrics, final_metric_step, completed_steps)
+    final_metric_step = int(completed_steps)
+    final_metrics["train/step"] = final_metric_step
+    final_metrics["inference/step"] = completed_steps
+    if enable_perf and previous_dispatch_wait is not None:
+        final_metrics["perf/dispatch_wait"] = previous_dispatch_wait
+        step_time = final_metrics.get("perf/step_time", 0)
+        if step_time > 0:
+            final_metrics["perf/train_capacity"] = args.global_batch_size / step_time
+    _write_training_metrics(final_metrics, final_metric_step, completed_steps)
 
     progress.close()
-
-    # Always save a final checkpoint unless saved.
-    if args.checkpoint_dir and last_saved_step != completed_steps:
-        eval_metrics = run_eval(completed_steps, train_group, eval_enabled)
-        logger.info(f"Saving final checkpoint at step {completed_steps}...")
-        train_group.save_model(completed_steps, force_sync=True)
-        best_eval_score = update_checkpoint_eval_meta(
-            args.checkpoint_dir, completed_steps, eval_metrics, best_eval_score
-        )
-        max_ckpts = getattr(args, "max_checkpoints", 0)
-        if max_ckpts > 0:
-            _cleanup_old_checkpoints(args.checkpoint_dir, max_ckpts)
-
-    final_status = ray.get(controller.get_full_status.remote())
+    final_status = controller.get_full_status()
     logger.info(
         f"Training completed: {completed_steps} steps in {final_status['elapsed_seconds']:.1f}s | "
         f"avg inference={final_status['avg_inference_speed']:.1f} entries/s | "
@@ -377,19 +344,15 @@ def run_training_loop(
     args,
     controller,
     inference_manager,
-    train_group,
-    inference_engines=None,
+    mooncake_master,
     dataset_size=None,
     eval_dataset_size=None,
 ):
-    inference_future = inference_manager.run.remote()
     try:
         return training_loop(
             args,
             controller,
             inference_manager,
-            train_group,
-            inference_engines=inference_engines,
             dataset_size=dataset_size,
             eval_dataset_size=eval_dataset_size,
         )
@@ -397,6 +360,5 @@ def run_training_loop(
         _safe_training_cleanup(
             args=args,
             inference_manager=inference_manager,
-            inference_future=inference_future,
-            inference_engines=inference_engines,
+            mooncake_master=mooncake_master,
         )

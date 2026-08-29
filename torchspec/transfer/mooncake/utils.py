@@ -63,8 +63,8 @@ def _subprocess_preexec():
     ctypes.CDLL("libc.so.6").prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
 
 
-class MooncakeMaster(RayActor):
-    """Ray actor that wraps the mooncake master subprocess.
+class MooncakeMaster:
+    """Class that manages the mooncake master subprocess.
 
     Provides automatic lifecycle management — when the actor is killed or garbage
     collected, the subprocess is terminated. Logs are streamed through Ray's
@@ -261,33 +261,27 @@ def launch_mooncake_master(args):
     Returns:
         The MooncakeMasterActor handle, or None if binary not found.
     """
-    from torchspec.ray.ray_actor import node_affinity_for_ip
 
     master_addr = getattr(args, "mooncake_master_server_address", None)
-    scheduling_strategy = None
-
     if master_addr is None:
-        host = RayActor.get_node_ip()
-        port = RayActor.find_free_port(start_port=random.randint(51000, 52000))
-        master_addr = f"{host}:{port}"
-        args.mooncake_master_server_address = master_addr
-        logger.info(f"Auto-resolved mooncake master_server_address: {master_addr}")
-    else:
-        if ":" in master_addr:
-            host = master_addr.split(":")[0]
-            port = int(master_addr.split(":")[1])
-        else:
-            host = master_addr
-            port = getattr(args, "mooncake_master_port", 50051)
+        logger.error(
+                "Missing mooncake_master_server_address. "
+                )
+        raise ValueError("Missing mooncake_master_server_address in args.")
 
-    # Pin actor to the user-specified node so the master starts on the right machine.
-    scheduling_strategy = node_affinity_for_ip(host, name="mooncake_master")
+    if ":" in master_addr:
+        host = master_addr.split(":")[0]
+        port = int(master_addr.split(":")[1])
+    else:
+        host = master_addr
+        port = getattr(args, "mooncake_master_port", 50051)
 
     http_port = getattr(args, "mooncake_metadata_port", None) or getattr(
         args, "mooncake_http_port", None
     )
     if http_port is None:
-        http_port = RayActor.find_free_port(start_port=random.randint(8100, 9100))
+        raise ValueError("Missing mooncake_metadata_port in args.")
+    else:
         args.mooncake_metadata_port = http_port
         logger.info(f"Auto-resolved mooncake metadata_port: {http_port}")
     http_host = getattr(args, "mooncake_http_host", "0.0.0.0")
@@ -298,34 +292,25 @@ def launch_mooncake_master(args):
         logger.warning(f"Binary not found at {mooncake_bin}, skipping launch")
         return None
 
-    RemoteActor = ray.remote(num_cpus=0, runtime_env={"env_vars": get_torchspec_env_vars()})(
-        MooncakeMaster
-    )
-    actor_options = {"name": "mooncake_master"}
-    if scheduling_strategy is not None:
-        actor_options["scheduling_strategy"] = scheduling_strategy
-    actor = RemoteActor.options(**actor_options).remote()
-
+    mooncake_master = MooncakeMaster()
     kv_lease_ttl_s = getattr(args, "mooncake_kv_lease_ttl_s", 5.0)
 
     try:
-        info = ray.get(actor.start.remote(port, http_port, http_host, kv_lease_ttl_s))
+        mooncake_info = mooncake_master.start(port, http_port, http_host, kv_lease_ttl_s)
         # Write back resolved values (actor may have updated host from node IP)
-        args.mooncake_master_server_address = info["master_addr"]
-        args.mooncake_metadata_port = info["metadata_port"]
-        logger.info(f"mooncake master actor started: {info}")
+        args.mooncake_master_server_address = mooncake_info["master_addr"]
+        args.mooncake_metadata_port = mooncake_info["metadata_port"]
+        logger.info(f"mooncake master server started: {info}")
     except Exception as e:
         logger.error(f"Failed to launch mooncake master actor: {e}")
         return None
 
-    args._mooncake_master_actor = actor
-
     def _cleanup():
         try:
-            ray.get(actor.shutdown.remote(), timeout=10)
+            mooncake_master.shutdown()
         except Exception:
             pass
 
     atexit.register(_cleanup)
 
-    return actor
+    return mooncake_master

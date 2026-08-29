@@ -374,6 +374,7 @@ def train_async_no_generation(args):
     logger.info(f"Dataset loaded on controller: {dataset_size} train, {eval_dataset_size} eval")
 
     # [4] Continue with initialization sequentially.
+    mooncake_master = None
     with timer.phase("Driver-side init"):
         roles = (
             {"training"}
@@ -381,7 +382,7 @@ def train_async_no_generation(args):
             else {"training", "inference"}
         )
         # pgs = create_placement_groups(args, roles=roles)
-        launch_mooncake_master(args)
+        mooncake_master = launch_mooncake_master(args)
         mooncake_config = build_mooncake_config(args)
 
 
@@ -389,85 +390,9 @@ def train_async_no_generation(args):
     with timer.phase("Auto-calculate training steps"):
         auto_calculate_training_steps(args, dataset_size)
 
-    # [6] Generate vocab mapping on controller if vocab pruning is enabled
-    vocab_mapping = None
-    draft_vocab_size = getattr(draft_model_config, "draft_vocab_size", None)
-    vocab_size = draft_model_config.vocab_size
-    if draft_vocab_size is not None and draft_vocab_size != vocab_size:
-        with timer.phase("Vocab mapping"):
-            if getattr(args, "keep_initial_vocab_mapping", False):
-                logger.info(
-                    "keep_initial_vocab_mapping=True: training against the mapping stored in the "
-                    "loaded draft weights, so no mapping is computed for this dataset"
-                )
-            elif getattr(args, "inference_engine_type", None) == "offline":
-                mapping_path = os.path.join(args.offline_data_path, "vocab_mapping.pt")
-                if not os.path.isfile(mapping_path):
-                    raise FileNotFoundError(
-                        "Offline replay requires the vocabulary mapping produced during "
-                        f"materialization: {mapping_path}"
-                    )
-                saved_mapping = torch.load(mapping_path, map_location="cpu", weights_only=True)
-                vocab_mapping = (saved_mapping["d2t"], saved_mapping["t2d"])
-            else:
-                logger.info(
-                    f"Computing vocab mapping on controller "
-                    f"(target={vocab_size}, draft={draft_vocab_size})..."
-                )
-                vocab_mapping = controller.compute_vocab_mapping(vocab_size, draft_vocab_size)
-            if vocab_mapping is not None:
-                logger.info(
-                    f"Generated vocab mapping: "
-                    f"d2t={vocab_mapping[0].shape}, t2d={vocab_mapping[1].shape}"
-                )
-
-    # [7] Create training actors + inference engines (args now has num_train_steps)
-    timer.begin_async("Actor initialization")
-    with timer.phase("Allocate actors + dispatch init"):
-        train_group = allocate_train_group(
-            args=args,
-            num_nodes=args.training_num_nodes,
-            num_gpus_per_node=args.training_num_gpus_per_node,
-            pg=pgs["training"],
-            training_class=TrainerActor,
-        )
-        train_init_refs = train_group.async_init(
-            args, role="training", mooncake_config=mooncake_config, with_ref=False
-        )
-
-        # Decode mode: create scratch draft checkpoint before inference engines
-        # are prepared, since they need decode_speculative_draft_model_path on args.
-        # This blocks on train actor init (FSDP gather), so inference engines are
-        # dispatched after to maximize parallelism with the wait below.
-        _maybe_create_scratch_draft(args, train_group)
-
-        inference_engines, engine_init_refs = prepare_inference_engines(
-            args, pgs["inference"], mooncake_config
-        )
-
-    # [8] Wait for all actor init to complete concurrently
-    n_train = len(train_init_refs)
-    logger.info(
-        f"Waiting for {n_train} training actors and {len(engine_init_refs)} "
-        f"inference engines to initialize in parallel..."
-    )
-    all_results = timer.wait("Actor initialization", train_init_refs + engine_init_refs)
-
-    train_results = all_results[:n_train]
-    assert len(set(train_results)) == 1
-    logger.info(
-        f"All {n_train} training actors and {len(engine_init_refs)} inference engines initialized"
-    )
-
-    if vocab_mapping is not None:
-        train_group.set_vocab_buffers(*vocab_mapping)
-        logger.info("Loaded vocab mapping into training actors")
-
     # [9] Setup async training with pre-created controller
     with timer.phase("Setup async training"):
-        controller, inference_manager = setup_async_training_with_engines(
-            args, train_group, mooncake_config, inference_engines, controller=controller
-        )
+        inference_manager = AsyncInferenceManager(args, controller)
 
     timer.log_summary()
 
@@ -476,8 +401,7 @@ def train_async_no_generation(args):
         args,
         controller,
         inference_manager,
-        train_group,
-        inference_engines=inference_engines,
+        mooncake_master,
         dataset_size=dataset_size,
         eval_dataset_size=eval_dataset_size,
     )
