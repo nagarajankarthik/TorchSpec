@@ -346,31 +346,19 @@ def train_async_no_generation(args):
         configure_offline_args(offline_dataset, args)
 
     init_tracking(args)
-    timer = _InitTimer()
 
     # [1] Create controller early (lightweight: only needs args + dp_size)
     with timer.phase("Create controller"):
         controller = AsyncTrainingController(args, args.dp_size)
 
-    # TODO: Remove this. It should live on the trainer side.
-    # [1.5] Parse draft config + DFlash validation (before any async work)
-    with timer.phase("Parse draft model config"):
-        draft_model_config = _get_draft_model_config(args)
-        args.draft_model_config_obj = draft_model_config
-
-        _validate_and_configure_dflash(args, draft_model_config)
-
     # [2] Kick off dataset loading on controller
     # The original design used Ray to locate the controller in a separate process
     # but that is no longer the case here. There may be some performance impact.
     timer.begin_async("Dataset loading")
-    dataset_size_ref = controller.load_dataset(args)
-    eval_dataset_size_ref = controller.load_eval_dataset(args)
+    dataset_size = controller.load_dataset(args)
+    eval_dataset_size = controller.load_eval_dataset(args)
 
     # [3] Wait for dataset sizes (small ints, unlike the old ray.put of the full dataset)
-    dataset_size, eval_dataset_size = timer.wait(
-        "Dataset loading", [dataset_size_ref, eval_dataset_size_ref]
-    )
     logger.info(f"Dataset loaded on controller: {dataset_size} train, {eval_dataset_size} eval")
 
     # [4] Continue with initialization sequentially.
@@ -381,9 +369,16 @@ def train_async_no_generation(args):
             if getattr(args, "inference_engine_type", None) == "offline"
             else {"training", "inference"}
         )
-        # pgs = create_placement_groups(args, roles=roles)
         mooncake_master = launch_mooncake_master(args)
         mooncake_config = build_mooncake_config(args)
+        mooncake_config_store = dataclasses.replace(
+            mooncake_config,
+            global_segment_size=0,
+            async_put_pool_size=0,
+        )
+
+        mooncake_store = EagleMooncakeStore(mooncake_config_store)
+        mooncake_store.setup(device=torch.cuda.current_device())
 
 
     # [5] Auto-calculate training steps (needs dataset_size)
@@ -402,6 +397,7 @@ def train_async_no_generation(args):
         controller,
         inference_manager,
         mooncake_master,
+        mooncake_store,
         dataset_size=dataset_size,
         eval_dataset_size=eval_dataset_size,
     )

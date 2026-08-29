@@ -37,6 +37,14 @@ from torchspec.utils.env import get_torchspec_env_vars
 from torchspec.utils.logging import logger
 
 
+def get_free_port():
+    # Create a standard TCP socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        # Binding to '' (or 'localhost') and port 0 tells the OS to assign a free port
+        s.bind(('', 0))
+        # Retrieve the port number assigned by the OS
+        return s.getsockname()[1]
+
 def resolve_mooncake_master_bin() -> str:
     """Resolve the path to the mooncake_master binary."""
     if "MOONCAKE_BUILD_DIR" in os.environ:
@@ -78,6 +86,7 @@ class MooncakeMaster:
     def start(
         self,
         port: int,
+        host: str,
         http_port: int,
         http_host: str = "0.0.0.0",
         kv_lease_ttl_s: float = 5.0,
@@ -102,7 +111,7 @@ class MooncakeMaster:
             raise FileNotFoundError(f"mooncake_master binary not found at {mooncake_bin}")
 
         # Pick a free port for metrics / admin server
-        metrics_port = self.find_free_port(start_port=random.randint(9100, 10100))
+        metrics_port = get_free_port()
         cmd = [
             mooncake_bin,
             f"--port={port}",
@@ -133,7 +142,6 @@ class MooncakeMaster:
                 f"mooncake master failed to start (exit code: {self._process.returncode})"
             )
 
-        host = self.get_node_ip()
         self._info = {
             "master_addr": f"{host}:{port}",
             "metadata_port": http_port,
@@ -296,11 +304,11 @@ def launch_mooncake_master(args):
     kv_lease_ttl_s = getattr(args, "mooncake_kv_lease_ttl_s", 5.0)
 
     try:
-        mooncake_info = mooncake_master.start(port, http_port, http_host, kv_lease_ttl_s)
+        mooncake_info = mooncake_master.start(port, host, http_port, http_host, kv_lease_ttl_s)
         # Write back resolved values (actor may have updated host from node IP)
         args.mooncake_master_server_address = mooncake_info["master_addr"]
         args.mooncake_metadata_port = mooncake_info["metadata_port"]
-        logger.info(f"mooncake master server started: {info}")
+        logger.info(f"mooncake master server started: {mooncake_info}")
     except Exception as e:
         logger.error(f"Failed to launch mooncake master actor: {e}")
         return None

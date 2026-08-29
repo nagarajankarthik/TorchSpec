@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 import os
+import warnings
 from dataclasses import dataclass
 from typing import Tuple
 from urllib.parse import urlparse
@@ -111,17 +112,11 @@ class MooncakeConfig:
 
     @staticmethod
     def _infer_num_aux_layers(args) -> int:
-        draft_cfg = getattr(args, "draft_model_config_obj", None)
-        if draft_cfg is not None:
-            target_layer_ids = getattr(draft_cfg, "target_layer_ids", None)
-            if target_layer_ids:
-                return len(target_layer_ids)
-            num_target_layers = getattr(draft_cfg, "num_target_layers", None)
-            if num_target_layers:
-                return int(num_target_layers)
         aux_layers = getattr(args, "aux_hidden_states_layers", None)
         if aux_layers:
             return len(aux_layers)
+        else:
+            warnings.warn("aux_hidden_states_layers not set, assuming 3")
         return 3
 
     @classmethod

@@ -37,7 +37,21 @@ from torchspec.controller.eval import (
     update_checkpoint_eval_meta,
 )
 from torchspec.utils.logging import get_tb_writer, logger
+from torchspec.training.data_fetcher import TrainSample
 
+def cleanup_mooncake_data(self, sample: TrainSample, store) -> None:
+        """Remove data from mooncake store to release buffer space."""
+        shapes = sample.tensor_shapes or {}
+        has_lhs = "last_hidden_states" in shapes
+        has_target = "target" in shapes
+
+        store.remove_eagle3_tensors(
+            sample.mooncake_key,
+            has_last_hidden_states=has_lhs,
+            has_target=has_target,
+        )
+
+    
 
 def _write_training_metrics(metrics: dict, train_step: int, inference_step: int) -> None:
     loss = metrics.get("train/avg_loss")
@@ -167,6 +181,7 @@ def training_loop(
     args,
     controller,
     inference_manager,
+    mooncake_store,
     dataset_size=None,
     eval_dataset_size=None,
 ):
@@ -307,7 +322,7 @@ def training_loop(
                         steps_in_current_epoch = 0
                         consecutive_failures = 0
                         logger.info(f"Dataset exhausted, reloading (epoch {current_epoch})...")
-                        ray.get(controller.reload_dataset.remote())
+                        controller.reload_dataset()
                     else:
                         logger.info("Max steps reached, stopping")
                         break
@@ -317,11 +332,11 @@ def training_loop(
             # The current optimizer step is fully queued.
             # The else branch is a no-op in this version since the trainer has to initiate the 
             # drawing of samples from the queue.
-            pass
-            # Inner while broke (max steps reached during reload), break outer loop
-        break
+            samples_delete = controller.drain_queues(controller.train_queues)
+
 
     final_metric_step = int(completed_steps)
+    final_metrics = {}
     final_metrics["train/step"] = final_metric_step
     final_metrics["inference/step"] = completed_steps
     if enable_perf and previous_dispatch_wait is not None:
@@ -345,6 +360,7 @@ def run_training_loop(
     controller,
     inference_manager,
     mooncake_master,
+    mooncake_store,
     dataset_size=None,
     eval_dataset_size=None,
 ):
@@ -353,6 +369,7 @@ def run_training_loop(
             args,
             controller,
             inference_manager,
+            mooncake_store,
             dataset_size=dataset_size,
             eval_dataset_size=eval_dataset_size,
         )

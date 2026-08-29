@@ -54,8 +54,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
-import ray
-from ray.util.queue import Queue
+from queue import Queue
 
 from torchspec.data.utils import length_grouped_order
 from torchspec.training.data_fetcher import TrainSample
@@ -562,6 +561,14 @@ class AsyncTrainingController:
                         queues[rank].put(sample)
                 else:
                     queues[dp_rank].put(sample)
+
+    def drain_queues(self, queues: list[Queue]) -> list[TrainSample]:
+        sample_list = []
+        for queue in queues:
+            while not queue.empty():
+                sample = queue.get()
+                sample_list.append(sample)
+        return sample_list
 
     def push_inference_sample(self, sample: InferenceOutput) -> int:
         """Add a single inference sample to the training pool.

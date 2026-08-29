@@ -38,11 +38,13 @@ Backpressure:
   training catches up and consumes data.
 """
 
+from __future__ import annotations
 import asyncio
 import time
+import aiohttp
 from collections import deque
 from typing import Any
-
+import torch
 
 from torchspec.utils.logging import logger
 from torchspec.utils.types import InferenceInput, InferenceOutput
@@ -170,7 +172,7 @@ class VLLMClient:
             """Assemble per-request vLLM prompt dicts, attaching multimodal data when present."""
 
             if multimodal_inputs is not None:
-                raise NotImplementedError, "Multimodal inputs not yet supported"
+                raise NotImplementedError("Multimodal inputs not yet supported")
 
             prompts: list = []
             for i in range(batch_size):
@@ -208,23 +210,25 @@ class VLLMClient:
             if (input_ids_ref is None) == (formatted_prompts is None):
                 raise ValueError("Exactly one of input_ids_ref or formatted_prompts must be set")
 
+            if multimodal_inputs is not None:
+                raise NotImplementedError("Multimodal inputs not yet supported")
+
             use_prompts = formatted_prompts is not None
             input_ids_list: list[torch.Tensor] | None = None
 
             if use_prompts:
                 batch_size = len(formatted_prompts)
+                prompts = formatted_prompts[0]
             else:
                 input_ids_list = input_ids_ref
-                if input_ids_list is None:
-                    raise ValueError("input_ids_ref resolved to None")
+                if input_ids_list is None or len(input_ids_list) == 0:
+                    raise ValueError("input_ids_ref resolved to None or empty list")
+                prompts = input_ids_list[0]
                 batch_size = len(input_ids_list)
 
-            prompts = self._build_prompts(
-                formatted_prompts=formatted_prompts if use_prompts else None,
-                input_ids_list=input_ids_list,
-                multimodal_inputs=multimodal_inputs,
-                batch_size=batch_size,
-            )
+            if batch_size > 1:
+                raise ValueError("MooncakeHiddenStatesConnector currently only allows for one sample per request. vLLM server will only return kv_transfer_params for the first sample.")
+
 
             if isinstance(data_id, str):
                 data_ids = [f"{data_id}_{i}" for i in range(batch_size)]
@@ -247,53 +251,52 @@ class VLLMClient:
                     if i < len(packed_loss_mask_list):
                         packed_loss_mask_map[did] = packed_loss_mask_list[i]
 
-            outputs = await self._infer(prompts, **sampling_params, use_tqdm=False)
+            response = await self._infer(prompts, **sampling_params)
 
             results = []
-            for i, output in enumerate(outputs):
-                seq_len = len(output.prompt_token_ids)
-                did = data_ids[i]
+            seq_len = len(response["choices"][0]["prompt_token_ids"])
+            did = data_ids[0]
 
-                kv_params = getattr(output, "kv_transfer_params", None)
-                if kv_params is None:
-                    logger.error(
-                        f"VllmEngine rank {self.rank}: No kv_transfer_params for data_id={did}. "
-                        f"The MooncakeHiddenStatesConnector may not have stored this request."
-                    )
-                    continue
+            kv_params = response["kv_transfer_params"]
+            if kv_params is None:
+                logger.error(
+                    f"No kv_transfer_params for data_id={did}. "
+                    f"The MooncakeHiddenStatesConnector may not have stored this request."
+                )
+                continue
 
-                mooncake_key = kv_params.get("mooncake_key", did)
-                tensor_shapes = kv_params.get("tensor_shapes", {})
-                tensor_dtypes = kv_params.get("tensor_dtypes", {})
+            mooncake_key = kv_params.get("mooncake_key", did)
+            tensor_shapes = kv_params.get("tensor_shapes", {})
+            tensor_dtypes = kv_params.get("tensor_dtypes", {})
 
-                result: dict[str, Any] = {
-                    "mooncake_key": mooncake_key,
-                    "tensor_shapes": tensor_shapes,
-                    "tensor_dtypes": tensor_dtypes,
-                    "data_id": did,
-                    "seq_len": seq_len,
+            result: dict[str, Any] = {
+                "mooncake_key": mooncake_key,
+                "tensor_shapes": tensor_shapes,
+                "tensor_dtypes": tensor_dtypes,
+                "data_id": did,
+                "seq_len": seq_len,
+            }
+            pp_layer_manifest = kv_params.get("pp_layer_manifest")
+            if pp_layer_manifest is not None:
+                result["metadata"] = {
+                    "vllm_pp_complete": True,
+                    "vllm_pp_layer_manifest": pp_layer_manifest,
                 }
-                pp_layer_manifest = kv_params.get("pp_layer_manifest")
-                if pp_layer_manifest is not None:
-                    result["metadata"] = {
-                        "vllm_pp_complete": True,
-                        "vllm_pp_layer_manifest": pp_layer_manifest,
-                    }
 
-                packed_loss_mask = packed_loss_mask_map.get(did)
-                if packed_loss_mask is not None:
-                    result["packed_loss_mask"] = packed_loss_mask
+            packed_loss_mask = packed_loss_mask_map.get(did)
+            if packed_loss_mask is not None:
+                result["packed_loss_mask"] = packed_loss_mask
 
-                input_ids_from_kv = kv_params.get("input_ids_list")
-                if input_ids_from_kv is not None:
-                    result["input_ids_list"] = input_ids_from_kv
-                else:
-                    result["input_ids_list"] = list(output.prompt_token_ids)
+            input_ids_from_kv = kv_params.get("input_ids_list")
+            if input_ids_from_kv is not None:
+                result["input_ids_list"] = input_ids_from_kv
+            else:
+                result["input_ids_list"] = list(response["choices"][0]["prompt_token_ids"])
 
-                results.append(result)
+            results.append(result)
 
             logger.debug(
-                f"VllmEngine rank {self.rank}: generated {len(results)} mooncake results "
+                f"Generated {len(results)} mooncake results "
                 f"for data_ids={data_ids}"
             )
             return results
@@ -308,6 +311,7 @@ class VLLMClient:
             "temperature": temperature,
             "top_p": top_p,
             "return_token_ids": True,           # need ids back, not text
+            "kv_transfer_params": True,
         }
         if seed is not None:
             payload["seed"] = seed
@@ -352,9 +356,9 @@ class AsyncInferenceManager:
         self.controller = controller
 
         vllm_endpoints = getattr(args, "vllm_endpoints", [])
-        vllm_timeouts_s = getattr(args, "vllm_timeouts_s", 10.0)
-        max_concurrent = getattr(args, "max_concurrent_batches", 1)
-        self._vllm_client = VllmClient(vllm_endpoints, vllm_timeout_s)
+        vllm_timeout_s = getattr(args, "vllm_timeouts_s", 10.0)
+        self._max_concurrent = getattr(args, "max_concurrent_batches", 1)
+        self._vllm_client = VLLMClient(vllm_endpoints, vllm_timeout_s)
         self._metrics = MetricsCollector()
 
         self._prompt_buffer: deque[InferenceInput] = deque()
@@ -389,7 +393,7 @@ class AsyncInferenceManager:
         """Main loop: refill runs in background, dispatch → collect in foreground."""
 
         logger.info("AsyncInferenceManager started")
-        self._vllm_client.init()
+        await self._vllm_client.init()
         refill_task = asyncio.create_task(self._continuous_refill())
 
         while self._running:
@@ -447,18 +451,15 @@ class AsyncInferenceManager:
 
         per_slot_rate = total_samples / total_time
         return {
-            "perf/infer_capacity": per_slot_rate * self._engines.max_concurrent,
             "perf/infer_batch_time": total_time / len(recent),
         }
 
     async def get_status(self) -> dict:
         """Get current status of inference manager."""
         status = {
-            "mode": f"distributed_engines ({len(self._engines)})",
             "prompt_buffer_size": len(self._prompt_buffer),
             "running": self._running,
             "pending_tasks": len(self._pending_tasks),
-            "engine_semaphore_available": getattr(self._engines.semaphore, "_value", None),
         }
         status.update(await self.get_pool_status())
         return status
@@ -466,7 +467,7 @@ class AsyncInferenceManager:
     async def get_pool_status(self) -> dict:
         """Get current sample pool status."""
         try:
-            pool_size = await self.controller.get_pool_size.remote()
+            pool_size = self.controller.get_pool_size()
         except Exception:
             pool_size = -1
 
@@ -487,7 +488,7 @@ class AsyncInferenceManager:
         """Dispatch batches from buffer, up to the engine concurrency limit."""
         while (
             len(self._prompt_buffer) >= self._batch_size
-            and len(self._pending_tasks) < self._engines.max_concurrent
+            and len(self._pending_tasks) < self._max_concurrent
         ):
             await self._await_pool_capacity()
             entries = self._take_batch(self._batch_size)
@@ -497,7 +498,7 @@ class AsyncInferenceManager:
         if (
             self._source_dry
             and 0 < len(self._prompt_buffer) < self._batch_size
-            and len(self._pending_tasks) < self._engines.max_concurrent
+            and len(self._pending_tasks) < self._max_concurrent
         ):
             await self._await_pool_capacity()
             entries = self._take_batch(self._batch_size)
@@ -536,7 +537,7 @@ class AsyncInferenceManager:
             return
 
         if self._max_pool_size > 0:
-            pool_size = await self.controller.get_pool_size.remote()
+            pool_size = self.controller.get_pool_size()
             if pool_size >= self._max_pool_size:
                 now = time.monotonic()
                 if now - self._last_pool_full_log_time >= 2.0:
@@ -548,7 +549,7 @@ class AsyncInferenceManager:
 
         need = self._buffer_low_watermark - len(self._prompt_buffer)
         fetch_size = max(need, self._refill_size)
-        entries = await self.controller.get_prompts.remote(fetch_size)
+        entries = self.controller.get_prompts(fetch_size)
         if entries:
             self._prompt_buffer.extend(entries)
             self._source_dry = False
@@ -568,7 +569,7 @@ class AsyncInferenceManager:
         if self._max_pool_size <= 0:
             return
 
-        pool_size = await self.controller.get_pool_size.remote()
+        pool_size = self.controller.get_pool_size()
         if pool_size < self._max_pool_size:
             return
 
@@ -581,7 +582,7 @@ class AsyncInferenceManager:
 
         while pool_size >= self._max_pool_size and self._running:
             await asyncio.sleep(MOONCAKE_BACKPRESSURE_POLL_INTERVAL)
-            pool_size = await self.controller.get_pool_size.remote()
+            pool_size = self.controller.get_pool_size()
 
             now = time.time()
             if now - last_log_time >= MOONCAKE_BACKPRESSURE_LOG_INTERVAL:
@@ -703,7 +704,7 @@ class AsyncInferenceManager:
                 inference_results.append(inference_result)
 
         if inference_results:
-            await self.controller.push_inference_results(inference_results)
+            self.controller.push_inference_results(inference_results)
             logger.debug(f"Forwarded {len(inference_results)} results to controller")
 
         return len(inference_results)
