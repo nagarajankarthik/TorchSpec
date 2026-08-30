@@ -48,6 +48,7 @@ import torch
 
 from torchspec.utils.logging import logger
 from torchspec.utils.types import InferenceInput, InferenceOutput
+from torchspec.config.mooncake_config import MooncakeConfig
 
 MOONCAKE_BACKPRESSURE_POLL_INTERVAL = 0.5  # seconds
 MOONCAKE_BACKPRESSURE_LOG_INTERVAL = 5.0  # seconds
@@ -389,7 +390,7 @@ class AsyncInferenceManager:
             logger.warning("Flow control disabled: max_pool_size=0 (unlimited generation)")
 
         self._mooncake_config = mooncake_config
-        self.shape_checked = False
+        self._shape_checked = False
 
     # -- Public API ----------------------------------------------------------
 

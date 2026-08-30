@@ -46,6 +46,7 @@ inference:
   vllm:
     tp_size: 1
     endpoints: [127.0.0.1:5000]
+    endpoints: ["http://127.0.0.1:8080"]
     timeout_s: 1800.0
     extra_args:
       max_num_batched_tokens: 65536
@@ -54,12 +55,15 @@ inference:
 
 mooncake:
   protocol: rdma
+  # TODO: Verify this by running ibv_devinfo
+  device_name: mlx5_0
   hidden_dim: 4096
-  max_seq_length: 16384
+  max_seq_len: 16384
   global_segment_size: 64GB
   local_buffer_size: 8GB
   master_server_address: null
   metadata_server: null
+  metadata_port: 8090
 
 output_dir: ./outputs/qwen3_5-35b-single-node
 cache_dir: ./cache/qwen3_5-35b-single-node
