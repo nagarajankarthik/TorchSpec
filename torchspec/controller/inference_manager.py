@@ -351,12 +351,13 @@ class AsyncInferenceManager:
         self,
         args,
         controller,
+        mooncake_config: MooncakeConfig,
     ):
         self.args = args
         self.controller = controller
 
         vllm_endpoints = getattr(args, "vllm_endpoints", [])
-        vllm_timeout_s = getattr(args, "vllm_timeouts_s", 10.0)
+        vllm_timeout_s = getattr(args, "vllm_timeout_s", 10.0)
         self._max_concurrent = getattr(args, "max_concurrent_batches", 1)
         self._vllm_client = VLLMClient(vllm_endpoints, vllm_timeout_s)
         self._metrics = MetricsCollector()
@@ -386,6 +387,9 @@ class AsyncInferenceManager:
             logger.info(f"Flow control enabled: max_pool_size={self._max_pool_size} samples")
         else:
             logger.warning("Flow control disabled: max_pool_size=0 (unlimited generation)")
+
+        self._mooncake_config = mooncake_config
+        self.shape_checked = False
 
     # -- Public API ----------------------------------------------------------
 
@@ -677,6 +681,11 @@ class AsyncInferenceManager:
             )
             return None
 
+# _parse_engine_output, right after the `"mooncake_key" not in output` guard
+        if not self._shape_checked:
+            self._check_shapes(output)
+            self._shape_checked = True
+
         self._metrics.record(output)
 
         metadata = dict(entry.metadata or {})
@@ -690,6 +699,23 @@ class AsyncInferenceManager:
             packed_loss_mask=output.get("packed_loss_mask", entry.packed_loss_mask),
             metadata=metadata,
         )
+
+    def _check_shapes(self, output: dict):
+        cfg = self._mooncake_config
+        shapes = output.get("tensor_shapes") or {}
+        hs, lhs = shapes.get("hidden_states"), shapes.get("last_hidden_states")
+        if hs is None or lhs is None:
+            raise RuntimeError(f"connector returned no hidden_states/last_hidden_states: {shapes}")
+        h = lhs[1]
+        if h != cfg.hidden_dim:
+            raise RuntimeError(f"mooncake.hidden_dim={cfg.hidden_dim} but connector reports H={h}")
+        k, rem = divmod(hs[1], h)
+        if rem or k != cfg.num_aux_layers:
+            raise RuntimeError(
+                f"connector concat width {hs[1]} = {k}×{h}; buffers sized for "
+                f"num_aux_layers={cfg.num_aux_layers}. The layer-id list passed to "
+                f"`vllm serve` needs num_aux_layers+1 entries."
+            )
 
     async def _forward_results(self, results: list[tuple[InferenceInput, Any | Exception]]) -> int:
         """Parse results and forward to controller. Returns success count."""

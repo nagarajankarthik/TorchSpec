@@ -362,12 +362,13 @@ def train_async_no_generation(args):
         mooncake_config = build_mooncake_config(args)
         mooncake_config_store = dataclasses.replace(
             mooncake_config,
-            global_segment_size=0,
-            async_put_pool_size=0,
+            global_segment_size=0,        # contributes no storage
+            async_put_pool_size=0,        # never puts
+            local_buffer_size=64 << 20,   # never gets
+            enable_gpu_direct=False,      # explicit; also skips the GPU receive buffer
         )
-
         mooncake_store = EagleMooncakeStore(mooncake_config_store)
-        mooncake_store.setup(device=torch.cuda.current_device())
+        mooncake_store.setup(device=torch.device("cpu"))
 
 
     # [5] Auto-calculate training steps (needs dataset_size)
@@ -376,7 +377,7 @@ def train_async_no_generation(args):
 
     # [9] Setup async training with pre-created controller
     with timer.phase("Setup async training"):
-        inference_manager = AsyncInferenceManager(args, controller)
+        inference_manager = AsyncInferenceManager(args, controller, mooncake_config)
 
     timer.log_summary()
 

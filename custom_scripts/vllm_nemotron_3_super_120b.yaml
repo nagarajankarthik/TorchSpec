@@ -22,8 +22,8 @@ model:
   trust_remote_code: true
 
 dataset:
-  train_data_path: ??
-  eval_data_path: ??
+  train_data_path: /mnt/weka/aisg/users/karthik/model_training_team/data_bank/torchspec/test.parquet
+  eval_data_path: null
   eval_interval: 1000
   # chat_template is not used for 
   # pre-tokenized datasets
@@ -31,6 +31,8 @@ dataset:
   prompt_key: conversations
   defer_tokenization: false
 
+training:
+  max_seq_length: 16384
 
 inference:
   inference_engine_type: vllm
@@ -39,18 +41,22 @@ inference:
   inference_num_gpus_per_node: 4
   max_sample_pool_size: 64
   inference_buffer_threshold: 32
-  inference_batch_size: 2
+  inference_batch_size: 1
   aux_hidden_states_layers: [3, 19, 35]
   vllm:
     tp_size: 1
+    endpoints: [127.0.0.1:5000]
+    timeout_s: 1800.0
     extra_args:
       max_num_batched_tokens: 65536
       enable_chunked_prefill: true
       enforce_eager: true
 
 mooncake:
-  protocol: tcp
-  global_segment_size: 128GB
+  protocol: rdma
+  hidden_dim: 4096
+  max_seq_length: 16384
+  global_segment_size: 64GB
   local_buffer_size: 8GB
   master_server_address: null
   metadata_server: null

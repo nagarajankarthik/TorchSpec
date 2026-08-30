@@ -106,6 +106,11 @@ class VllmConfig:
     # inspect (e.g. quantization, max_model_len, trust_remote_code, ...).
     extra_args: Dict[str, Any] = field(default_factory=dict)
 
+    # Endpoint of vllm server that is launched before running TorchSpec entry point.
+    endpoints: Optional[list[str]] = None
+    # Timeout for requests to vllm server
+    timeout_s: float = 1800.0
+
 
 @dataclass
 class TrtllmConfig:

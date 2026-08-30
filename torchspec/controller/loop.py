@@ -138,7 +138,7 @@ def _cleanup_old_checkpoints(checkpoint_dir: str | None, max_checkpoints: int) -
 
 
 def _safe_training_cleanup(
-    args, inference_manager, mooncake_master = None,inference_future = None, inference_engines=None
+    args, inference_manager, mooncake_master = None, mooncake_store = None, inference_future = None, inference_engines=None
 ) -> None:
     """Best-effort teardown for inference manager and mooncake master actor."""
     if inference_manager is not None:
@@ -173,6 +173,12 @@ def _safe_training_cleanup(
             mooncake_master.shutdown()
         except Exception as exc:
             logger.warning(f"Failed to shutdown mooncake master: {exc}")
+
+    if mooncake_store is not None:
+        try:
+            mooncake_store.close()
+        except Exception as exc:
+            logger.warning(f"Failed to shutdown mooncake store: {exc}")
 
 
 def training_loop(
@@ -380,4 +386,5 @@ def run_training_loop(
             args=args,
             inference_manager=inference_manager,
             mooncake_master=mooncake_master,
+            mooncake_store=mooncake_store,
         )
