@@ -65,8 +65,8 @@ mooncake:
   metadata_server: null
   metadata_port: 8090
 
-output_dir: ./outputs/qwen3_5-35b-single-node
-cache_dir: ./cache/qwen3_5-35b-single-node
+output_dir: ./outputs/nemotron_3_120b_test
+cache_dir: ./cache/nemotron_3_120b_test
 model_download_dir: null
 
 debug:
