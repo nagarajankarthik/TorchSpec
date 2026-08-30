@@ -30,14 +30,9 @@ import ray
 import wandb
 from tqdm import tqdm
 
-from torchspec.controller.eval import (
-    generate_eval_cache,
-    run_eval,
-    setup_eval,
-    update_checkpoint_eval_meta,
-)
-from torchspec.utils.logging import get_tb_writer, logger
 from torchspec.training.data_fetcher import TrainSample
+from torchspec.utils.logging import get_tb_writer, logger
+
 
 def cleanup_mooncake_data(sample: TrainSample, store) -> None:
         """Remove data from mooncake store to release buffer space."""
@@ -189,7 +184,13 @@ def training_loop(
     dataset_size=None,
     eval_dataset_size=None,
 ):
-    """Run the training loop with sync training and async inference.
+    """
+    In this branch, this function has been modified to run inference only. 
+
+    Hence, terms like completed_steps and num_steps refer to the number of times 
+    `try_dispatch_batch` is successfully executed by the training controller.
+
+    They have no connection to the number of optimizer steps performed by the trainers.
 
     Evaluation is temporarily disabled for now.
 
@@ -220,16 +221,12 @@ def training_loop(
             f"Ensure controller.load_dataset() was called before run_training_loop()."
         )
 
-    dp_size = (
-        getattr(args, "dp_size", None) or args.training_num_nodes * args.training_num_gpus_per_node
-    )
-    num_steps = args.num_train_steps
-    accumulation_steps = getattr(args, "draft_accumulation_steps", 1)
-    # steps_per_epoch in optimizer steps, pre-computed in auto_calculate_training_steps
-    steps_per_epoch = getattr(args, "steps_per_epoch", dataset_size // args.global_batch_size)
+    dp_size = controller.dp_size
+    steps_per_epoch = dataset_size // controller.dispatch_batch_size
     if steps_per_epoch == 0:
         steps_per_epoch = 1
     num_epochs = getattr(args, "num_epochs", 1)
+    num_steps = num_epochs * steps_per_epoch
 
     # Submit training data AFTER eval hs generation so that training prompts don't
     # leak into the inference pipeline during eval.
@@ -237,18 +234,17 @@ def training_loop(
     # async prompt/result buffers can still lose or replay a small tail.
     start_step = getattr(args, "resume_from_step", 0)
     resume_epoch = start_step // steps_per_epoch if steps_per_epoch > 0 else 0
-    resume_skip = (start_step % steps_per_epoch) * args.global_batch_size if start_step > 0 else 0
+    resume_skip = (start_step % steps_per_epoch) * controller.dispatch_batch_size if start_step > 0 else 0
     controller.submit_training_dataset(epoch=resume_epoch, skip=resume_skip)
 
     logger.info(
         f"Starting: num_steps={num_steps}, num_epochs={num_epochs}, "
-        f"steps_per_epoch={steps_per_epoch}, global_batch_size={args.global_batch_size}, "
-        f"accumulation_steps={accumulation_steps}, "
+        f"steps_per_epoch={steps_per_epoch}, "
         f"dp_size={dp_size}, per_dp_rank_batch_size={args.per_dp_rank_batch_size}"
     )
 
     enable_perf = getattr(args, "enable_perf_metrics", True)
-    prefetch_batches = max(accumulation_steps, getattr(args, "prefetch_depth", 0))
+    prefetch_batches = getattr(args, "prefetch_batches", 1)
 
     completed_steps = start_step
     current_epoch = completed_steps // steps_per_epoch + 1
@@ -258,18 +254,14 @@ def training_loop(
     dispatch_attempts = 0
     consecutive_failures = 0
     queued_batches = 0
-    last_saved_step: int | None = None
     previous_dispatch_wait: float | None = None
-    progress = tqdm(total=num_steps, desc="Training", unit="step", initial=start_step)
+    progress = tqdm(total=num_steps, desc="Running Inference", unit="step", initial=start_step)
     while completed_steps < num_steps:
         remaining_steps = min(
             num_steps - completed_steps,
             steps_per_epoch - steps_in_current_epoch,
         )
-        target_queued_batches = min(
-            prefetch_batches,
-            remaining_steps * accumulation_steps,
-        )
+        target_queued_batches = min(prefetch_batches, remaining_steps)
         if enable_perf:
             t_dispatch = time.time()
         status = None
@@ -278,14 +270,10 @@ def training_loop(
             dispatched = controller.try_dispatch_batch()
             if dispatched:
                 queued_batches += 1
+                completed_steps += 1
                 consecutive_failures = 0
             else:
                 consecutive_failures += 1
-                if queued_batches >= accumulation_steps:
-                    # The current step can run while inference refills the pool.
-                    target_queued_batches = queued_batches
-                    consecutive_failures = 0
-                    continue
 
                 # Only fetch status when needed for logging or reload decision
                 if dispatch_attempts % 100 == 0 or consecutive_failures >= 500:
@@ -314,7 +302,7 @@ def training_loop(
                         f"Pool insufficient for dispatch "
                         f"(pool_size={status['sample_pool_size']}, "
                         f"need={status['dispatch_batch_size']}, "
-                        f"{queued_batches}/{accumulation_steps} batches queued, "
+                        f"{queued_batches} batches queued, "
                         f"{steps_in_current_epoch}/{steps_per_epoch} steps in epoch). "
                         f"Reloading dataset."
                     )
@@ -333,14 +321,14 @@ def training_loop(
 
                 time.sleep(0.01)
         else:
-            # The current optimizer step is fully queued.
-            # The else branch is a no-op in this version since the trainer has to initiate the 
-            # drawing of samples from the queue.
+            # The else branch is a no-op in this version since the trainer has to initiate the
+            # drawing of samples from the queue and training is decoupled from inference.
+            # The train queues and mooncake store are currently drained here for testing purposes
+            # only.
             samples_delete = controller.drain_queues(controller.train_queues)
             for sample in samples_delete:
                 cleanup_mooncake_data(sample, mooncake_store)
             queued_batches = 0
-            completed_steps += 1
 
 
     final_metric_step = int(completed_steps)
@@ -350,8 +338,6 @@ def training_loop(
     if enable_perf and previous_dispatch_wait is not None:
         final_metrics["perf/dispatch_wait"] = previous_dispatch_wait
         step_time = final_metrics.get("perf/step_time", 0)
-        if step_time > 0:
-            final_metrics["perf/train_capacity"] = args.global_batch_size / step_time
     _write_training_metrics(final_metrics, final_metric_step, completed_steps)
 
     progress.close()
