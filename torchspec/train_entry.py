@@ -21,6 +21,7 @@
 """Training entry point for Eagle3 speculative decoding."""
 
 import argparse
+import dataclasses
 import os
 import sys
 import time
@@ -36,7 +37,6 @@ from typing import Any, Generator
 import ray
 import torch
 from omegaconf import OmegaConf
-from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from torchspec import AutoDraftModelConfig
 from torchspec.config.train_config import config_to_flat_args, load_config
@@ -46,16 +46,10 @@ from torchspec.controller import (
     auto_calculate_training_steps,
     build_mooncake_config,
     run_training_loop,
-    setup_async_training_with_engines,
 )
-from torchspec.inference.factory import prepare_inference_engines
-from torchspec.ray.placement_group import (
-    allocate_train_group,
-    create_placement_groups,
-)
-from torchspec.training.trainer_actor import TrainerActor
+from torchspec.controller.inference_manager import AsyncInferenceManager
+from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
 from torchspec.transfer.mooncake.utils import launch_mooncake_master
-from torchspec.utils.env import get_torchspec_env_vars
 from torchspec.utils.logging import init_tracking, logger
 
 _Phase = namedtuple("_Phase", ["name", "duration", "is_async", "blocked"])
@@ -346,6 +340,7 @@ def train_async_no_generation(args):
         configure_offline_args(offline_dataset, args)
 
     init_tracking(args)
+    timer = _InitTimer()
 
     # [1] Create controller early (lightweight: only needs args + dp_size)
     with timer.phase("Create controller"):
@@ -356,19 +351,13 @@ def train_async_no_generation(args):
     # but that is no longer the case here. There may be some performance impact.
     timer.begin_async("Dataset loading")
     dataset_size = controller.load_dataset(args)
-    eval_dataset_size = controller.load_eval_dataset(args)
 
     # [3] Wait for dataset sizes (small ints, unlike the old ray.put of the full dataset)
-    logger.info(f"Dataset loaded on controller: {dataset_size} train, {eval_dataset_size} eval")
+    logger.info(f"Dataset loaded on controller: {dataset_size} train")
 
     # [4] Continue with initialization sequentially.
     mooncake_master = None
     with timer.phase("Driver-side init"):
-        roles = (
-            {"training"}
-            if getattr(args, "inference_engine_type", None) == "offline"
-            else {"training", "inference"}
-        )
         mooncake_master = launch_mooncake_master(args)
         mooncake_config = build_mooncake_config(args)
         mooncake_config_store = dataclasses.replace(

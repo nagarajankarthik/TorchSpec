@@ -39,7 +39,7 @@ from torchspec.controller.eval import (
 from torchspec.utils.logging import get_tb_writer, logger
 from torchspec.training.data_fetcher import TrainSample
 
-def cleanup_mooncake_data(self, sample: TrainSample, store) -> None:
+def cleanup_mooncake_data(sample: TrainSample, store) -> None:
         """Remove data from mooncake store to release buffer space."""
         shapes = sample.tensor_shapes or {}
         has_lhs = "last_hidden_states" in shapes
@@ -50,8 +50,6 @@ def cleanup_mooncake_data(self, sample: TrainSample, store) -> None:
             has_last_hidden_states=has_lhs,
             has_target=has_target,
         )
-
-    
 
 def _write_training_metrics(metrics: dict, train_step: int, inference_step: int) -> None:
     loss = metrics.get("train/avg_loss")
@@ -333,6 +331,9 @@ def training_loop(
             # The else branch is a no-op in this version since the trainer has to initiate the 
             # drawing of samples from the queue.
             samples_delete = controller.drain_queues(controller.train_queues)
+            for sample in samples_delete:
+                cleanup_mooncake_data(sample, mooncake_store)
+            completed_steps += 1
 
 
     final_metric_step = int(completed_steps)

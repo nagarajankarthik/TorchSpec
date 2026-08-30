@@ -223,7 +223,7 @@ class VLLMClient:
                 input_ids_list = input_ids_ref
                 if input_ids_list is None or len(input_ids_list) == 0:
                     raise ValueError("input_ids_ref resolved to None or empty list")
-                prompts = input_ids_list[0]
+                prompts = self._normalize_input_ids(input_ids_list[0]).tolist()
                 batch_size = len(input_ids_list)
 
             if batch_size > 1:
@@ -263,7 +263,6 @@ class VLLMClient:
                     f"No kv_transfer_params for data_id={did}. "
                     f"The MooncakeHiddenStatesConnector may not have stored this request."
                 )
-                continue
 
             mooncake_key = kv_params.get("mooncake_key", did)
             tensor_shapes = kv_params.get("tensor_shapes", {})
