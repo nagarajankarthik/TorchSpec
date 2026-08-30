@@ -33,6 +33,7 @@ dataset:
 
 training:
   max_seq_length: 16384
+  max_concurrent_batches: 32
 
 inference:
   inference_engine_type: vllm
@@ -45,7 +46,6 @@ inference:
   aux_hidden_states_layers: [3, 19, 35]
   vllm:
     tp_size: 1
-    endpoints: [127.0.0.1:5000]
     endpoints: ["http://127.0.0.1:8080"]
     timeout_s: 1800.0
     extra_args:
