@@ -333,6 +333,7 @@ def training_loop(
             samples_delete = controller.drain_queues(controller.train_queues)
             for sample in samples_delete:
                 cleanup_mooncake_data(sample, mooncake_store)
+            queued_batches = 0
             completed_steps += 1
 
 

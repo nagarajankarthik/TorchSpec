@@ -263,6 +263,7 @@ class VLLMClient:
                     f"No kv_transfer_params for data_id={did}. "
                     f"The MooncakeHiddenStatesConnector may not have stored this request."
                 )
+                return []
 
             mooncake_key = kv_params.get("mooncake_key", did)
             tensor_shapes = kv_params.get("tensor_shapes", {})

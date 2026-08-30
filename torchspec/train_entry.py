@@ -388,7 +388,6 @@ def train_async_no_generation(args):
         mooncake_master,
         mooncake_store,
         dataset_size=dataset_size,
-        eval_dataset_size=eval_dataset_size,
     )
 
 
