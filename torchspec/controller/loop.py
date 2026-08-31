@@ -164,7 +164,7 @@ def _safe_training_cleanup(
             except Exception as exc:
                 logger.warning(f"Engine shutdown timed out or failed: {exc}")
 
-    if mooncake_store is not None:
+    if mooncake_store is not None and controller is not None:
         for leftover in controller.drain_pool():
             cleanup_mooncake_data(leftover, mooncake_store)
 
@@ -233,16 +233,11 @@ def training_loop(
     num_steps = num_epochs * steps_per_epoch
 
     def _pipeline_idle() -> bool:
-        st = inference_manager.get_status()
-        return (st["prompt_buffer_size"] == 0
-                and st["pending_tasks"] == 0
-                and controller.get_pool_size() == 0)
+        status = inference_manager.get_status()
+        return (status["prompt_buffer_size"] == 0
+                and status["pending_tasks"] == 0
+                and status["current_pool_size"] == 0)
 
-    startup_deadline = time.monotonic() + 60
-    while _pipeline_idle():
-        if time.monotonic() > startup_deadline:
-            raise RuntimeError("inference manager never picked up any prompts")
-        time.sleep(0.1)
 
     # Submit training data AFTER eval hs generation so that training prompts don't
     # leak into the inference pipeline during eval.
@@ -253,13 +248,18 @@ def training_loop(
     resume_skip = (start_step % steps_per_epoch) * controller.dispatch_batch_size if start_step > 0 else 0
     controller.submit_training_dataset(epoch=resume_epoch, skip=resume_skip)
 
+    startup_deadline = time.monotonic() + 60
+    while _pipeline_idle():
+        if time.monotonic() > startup_deadline:
+            raise RuntimeError("inference manager never picked up any prompts")
+        time.sleep(0.1)
+
     logger.info(
         f"Starting: num_steps={num_steps}, num_epochs={num_epochs}, "
         f"steps_per_epoch={steps_per_epoch}, "
         f"dispatch_batch_size={controller.dispatch_batch_size}"
     )
 
-    enable_perf = getattr(args, "enable_perf_metrics", True)
     prefetch_batches = getattr(args, "prefetch_depth", 1)
 
     completed_steps = start_step
@@ -268,14 +268,9 @@ def training_loop(
     if start_step > 0:
         logger.info(f"Resuming from step {start_step} (epoch {current_epoch})")
     queued_batches = 0
-    previous_dispatch_wait: float | None = None
     progress = tqdm(total=num_steps, desc="Running Inference", unit="step", initial=start_step)
-    max_attempts_per_step = 100
     for step in range(start_step, num_steps):
-        inference_manager_status = inference_manager.get_status()
-        inference_prompt_buffer_size = inference_manager_status["prompt_buffer_size"]
-        inference_pending_tasks = inference_manager_status["pending_tasks"]
-        if _is_pipeline_idle():
+        if _pipeline_idle():
             logger.info(f"Inference prompt buffer and controller sample pool drained at step {step}")
             break
         begin_next_epoch = steps_in_current_epoch >= steps_per_epoch and completed_steps < num_steps
@@ -288,7 +283,7 @@ def training_loop(
         while not controller.try_dispatch_batch():
             if time.monotonic() > deadline:
                 raise RuntimeError(
-                    f"Failed to dispatch batch after {max_attempts_per_step} attempts "
+                    f"Failed to dispatch batch after 600s "
                     f"(epoch {current_epoch}, step {completed_steps})"
                 )
             time.sleep(0.05)
@@ -306,9 +301,6 @@ def training_loop(
     final_metrics = {}
     final_metrics["train/step"] = final_metric_step
     final_metrics["inference/step"] = completed_steps
-    if enable_perf and previous_dispatch_wait is not None:
-        final_metrics["perf/dispatch_wait"] = previous_dispatch_wait
-        step_time = final_metrics.get("perf/step_time", 0)
     _write_training_metrics(final_metrics, final_metric_step, completed_steps)
 
     progress.close()
