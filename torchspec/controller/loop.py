@@ -256,82 +256,41 @@ def training_loop(
     queued_batches = 0
     previous_dispatch_wait: float | None = None
     progress = tqdm(total=num_steps, desc="Running Inference", unit="step", initial=start_step)
-    while completed_steps < num_steps:
-        remaining_steps = min(
-            num_steps - completed_steps,
-            steps_per_epoch - steps_in_current_epoch,
-        )
-        target_queued_batches = min(prefetch_batches, remaining_steps)
-        if enable_perf:
-            t_dispatch = time.time()
-        status = None
-        while queued_batches < target_queued_batches:
-            dispatch_attempts += 1
+    max_attempts_per_step = 100
+    for step in range(start_step, num_steps):
+        target_queued_batches = min(prefetch_batches, steps_per_epoch - steps_in_current_epoch)
+        inference_manager_status = asyncio.run(inference_manager.get_status())
+        inference_prompt_buffer_size = inference_manager_status["prompt_buffer_size"]
+        inference_pending_tasks = inference_manager_status["pending_tasks"]
+        drained = inference_prompt_buffer_size == 0 and inference_pending_tasks == 0 and controller.get_pool_size() == 0
+        begin_next_epoch = steps_in_current_epoch >= steps_per_epoch and completed_steps < num_steps
+        if drained or begin_next_epoch:
+            current_epoch += 1
+            steps_in_current_epoch = 0
+            consecutive_failures = 0
+            logger.info(f"Dataset exhausted, reloading (epoch {current_epoch})...")
+            controller.reload_dataset()
+        dispatch_attempts = 0
+        dispatched = False
+        while not dispatched and dispatch_attempts < max_attempts_per_step:
             dispatched = controller.try_dispatch_batch()
-            if dispatched:
-                queued_batches += 1
-                completed_steps += 1
-                steps_in_current_epoch += 1
-                progress.update(1)
-                consecutive_failures = 0
-            else:
-                consecutive_failures += 1
-
-                # Only fetch status when needed for logging or reload decision
-                if dispatch_attempts % 100 == 0 or consecutive_failures >= 500:
-                    status = controller.get_full_status()
-
-                if dispatch_attempts % 100 == 0 and status is not None:
-                    logger.debug(
-                        f"Epoch {current_epoch}, Step {completed_steps}: "
-                        f"dispatch failed {dispatch_attempts} times "
-                        f"(consecutive={consecutive_failures}), "
-                        f"pool_size={status['sample_pool_size']}, "
-                        f"need={status['dispatch_batch_size']}"
-                    )
-
-                should_reload = False
-                if steps_in_current_epoch >= steps_per_epoch:
-                    should_reload = True
-                elif (
-                    consecutive_failures >= 500
-                    and (completed_steps > 0 or queued_batches > 0)
-                    and status is not None
-                    and status["sample_pool_size"] < status["dispatch_batch_size"]
-                    and status.get("prompt_buffer_size", 0) == 0
-                ):
-                    logger.warning(
-                        f"Pool insufficient for dispatch "
-                        f"(pool_size={status['sample_pool_size']}, "
-                        f"need={status['dispatch_batch_size']}, "
-                        f"{queued_batches} batches queued, "
-                        f"{steps_in_current_epoch}/{steps_per_epoch} steps in epoch). "
-                        f"Reloading dataset."
-                    )
-                    should_reload = True
-
-                if should_reload:
-                    if completed_steps < num_steps:
-                        current_epoch += 1
-                        steps_in_current_epoch = 0
-                        consecutive_failures = 0
-                        logger.info(f"Dataset exhausted, reloading (epoch {current_epoch})...")
-                        controller.reload_dataset()
-                    else:
-                        logger.info("Max steps reached, stopping")
-                        break
-
-                time.sleep(0.01)
+            dispatch_attempts += 1
+        if dispatched:
+            queued_batches += 1
+            completed_steps += 1
+            steps_in_current_epoch += 1
+            progress.update(1)
+            consecutive_failures = 0
         else:
-            # The else branch is a no-op in this version since the trainer has to initiate the
-            # drawing of samples from the queue and training is decoupled from inference.
-            # The train queues and mooncake store are currently drained here for testing purposes
-            # only.
+            raise RuntimeError(
+                f"Failed to dispatch batch after {max_attempts_per_step} attempts "
+                f"(epoch {current_epoch}, step {completed_steps})"
+            )
+        if queued_batches == prefetch_batches or step == num_steps - 1:
             samples_delete = controller.drain_queues(controller.train_queues)
             for sample in samples_delete:
                 cleanup_mooncake_data(sample, mooncake_store)
             queued_batches = 0
-
 
     final_metric_step = int(completed_steps)
     final_metrics = {}
