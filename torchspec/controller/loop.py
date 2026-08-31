@@ -134,7 +134,7 @@ def _cleanup_old_checkpoints(checkpoint_dir: str | None, max_checkpoints: int) -
 
 
 def _safe_training_cleanup(
-    args, inference_manager, controller, mooncake_master = None, mooncake_store = None, inference_future = None, inference_engines=None
+    args, inference_manager, controller = None, mooncake_master = None, mooncake_store = None, inference_future = None, inference_engines=None
 ) -> None:
     """Best-effort teardown for inference manager and mooncake master actor."""
     if inference_manager is not None:
@@ -164,7 +164,9 @@ def _safe_training_cleanup(
             except Exception as exc:
                 logger.warning(f"Engine shutdown timed out or failed: {exc}")
 
-    controller.drain_pool()
+    if mooncake_store is not None:
+        for leftover in controller.drain_pool():
+            cleanup_mooncake_data(leftover, mooncake_store)
 
     if mooncake_master is not None:
         try:
@@ -230,6 +232,18 @@ def training_loop(
     num_epochs = getattr(args, "num_epochs", 1)
     num_steps = num_epochs * steps_per_epoch
 
+    def _pipeline_idle() -> bool:
+        st = inference_manager.get_status()
+        return (st["prompt_buffer_size"] == 0
+                and st["pending_tasks"] == 0
+                and controller.get_pool_size() == 0)
+
+    startup_deadline = time.monotonic() + 60
+    while _pipeline_idle():
+        if time.monotonic() > startup_deadline:
+            raise RuntimeError("inference manager never picked up any prompts")
+        time.sleep(0.1)
+
     # Submit training data AFTER eval hs generation so that training prompts don't
     # leak into the inference pipeline during eval.
     # Resume is best-effort: completed optimizer steps determine epoch/skip, but
@@ -261,8 +275,7 @@ def training_loop(
         inference_manager_status = inference_manager.get_status()
         inference_prompt_buffer_size = inference_manager_status["prompt_buffer_size"]
         inference_pending_tasks = inference_manager_status["pending_tasks"]
-        drained = inference_prompt_buffer_size == 0 and inference_pending_tasks == 0 and controller.get_pool_size() == 0
-        if drained:
+        if _is_pipeline_idle():
             logger.info(f"Inference prompt buffer and controller sample pool drained at step {step}")
             break
         begin_next_epoch = steps_in_current_epoch >= steps_per_epoch and completed_steps < num_steps
@@ -278,6 +291,7 @@ def training_loop(
                     f"Failed to dispatch batch after {max_attempts_per_step} attempts "
                     f"(epoch {current_epoch}, step {completed_steps})"
                 )
+            time.sleep(0.05)
         queued_batches += 1
         completed_steps += 1
         steps_in_current_epoch += 1

@@ -25,6 +25,8 @@ import dataclasses
 import os
 import sys
 import time
+import threading
+import asyncio
 
 # Fix PyTorch 2.9+ TorchInductor GEMM backend regression: without this,
 # FlexAttention backward pass hits NoValidChoicesError and training is 3x slower.
