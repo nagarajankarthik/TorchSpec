@@ -399,6 +399,8 @@ def train_async_no_generation(args):
         dataset_size=dataset_size,
     )
 
+    mgr_thread.join()
+
 
 if __name__ == "__main__":
     args = parse_config()
