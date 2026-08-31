@@ -394,12 +394,11 @@ def train_async_no_generation(args):
         args,
         controller,
         inference_manager,
+        mgr_thread,
         mooncake_master,
         mooncake_store,
         dataset_size=dataset_size,
     )
-
-    mgr_thread.join()
 
 
 if __name__ == "__main__":

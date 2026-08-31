@@ -134,7 +134,7 @@ def _cleanup_old_checkpoints(checkpoint_dir: str | None, max_checkpoints: int) -
 
 
 def _safe_training_cleanup(
-    args, inference_manager, controller = None, mooncake_master = None, mooncake_store = None, inference_future = None, inference_engines=None
+    args, inference_manager, mgr_thread = None, controller = None, mooncake_master = None, mooncake_store = None, inference_future = None, inference_engines=None
 ) -> None:
     """Best-effort teardown for inference manager and mooncake master actor."""
     if inference_manager is not None:
@@ -142,6 +142,13 @@ def _safe_training_cleanup(
             inference_manager.stop()
         except Exception as exc:
             logger.warning(f"Failed to stop inference manager: {exc}")
+        if mgr_thread is not None:
+            mgr_thread.join(timeout=60)
+            if mgr_thread.is_alive():
+                logger.warning(
+                    "inference manager thread still running after 60s; "
+                    "in-flight extraction requests may be aborted"
+                )
         if inference_future is not None:
             try:
                 ray.get(inference_future)
@@ -236,8 +243,9 @@ def training_loop(
         status = inference_manager.get_status()
         return (status["prompt_buffer_size"] == 0
                 and status["pending_tasks"] == 0
-                and status["current_pool_size"] == 0)
-
+                and status["current_pool_size"] == 0
+                and controller.get_prompt_buffer_size() == 0
+                )
 
     # Submit training data AFTER eval hs generation so that training prompts don't
     # leak into the inference pipeline during eval.
@@ -316,6 +324,7 @@ def run_training_loop(
     args,
     controller,
     inference_manager,
+    mgr_thread,
     mooncake_master,
     mooncake_store,
     dataset_size=None,
@@ -334,6 +343,7 @@ def run_training_loop(
         _safe_training_cleanup(
             args=args,
             inference_manager=inference_manager,
+            mgr_thread=mgr_thread,
             controller=controller,
             mooncake_master=mooncake_master,
             mooncake_store=mooncake_store,
