@@ -244,7 +244,7 @@ def training_loop(
     )
 
     enable_perf = getattr(args, "enable_perf_metrics", True)
-    prefetch_batches = getattr(args, "prefetch_batches", 1)
+    prefetch_batches = getattr(args, "prefetch_depth", 1)
 
     completed_steps = start_step
     current_epoch = completed_steps // steps_per_epoch + 1
@@ -271,6 +271,8 @@ def training_loop(
             if dispatched:
                 queued_batches += 1
                 completed_steps += 1
+                steps_in_current_epoch += 1
+                progress.update(1)
                 consecutive_failures = 0
             else:
                 consecutive_failures += 1
