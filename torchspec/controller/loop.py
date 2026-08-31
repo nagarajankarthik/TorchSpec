@@ -132,8 +132,9 @@ def _cleanup_old_checkpoints(checkpoint_dir: str | None, max_checkpoints: int) -
             logger.warning(f"Failed to remove old checkpoint {old_dir}: {e}")
 
 
+
 def _safe_training_cleanup(
-    args, inference_manager, mooncake_master = None, mooncake_store = None, inference_future = None, inference_engines=None
+    args, inference_manager, controller, mooncake_master = None, mooncake_store = None, inference_future = None, inference_engines=None
 ) -> None:
     """Best-effort teardown for inference manager and mooncake master actor."""
     if inference_manager is not None:
@@ -162,6 +163,8 @@ def _safe_training_cleanup(
                 ray.get(ref, timeout=30)
             except Exception as exc:
                 logger.warning(f"Engine shutdown timed out or failed: {exc}")
+
+    controller.drain_pool()
 
     if mooncake_master is not None:
         try:
@@ -221,7 +224,6 @@ def training_loop(
             f"Ensure controller.load_dataset() was called before run_training_loop()."
         )
 
-    dp_size = controller.dp_size
     steps_per_epoch = dataset_size // controller.dispatch_batch_size
     if steps_per_epoch == 0:
         steps_per_epoch = 1
@@ -240,7 +242,7 @@ def training_loop(
     logger.info(
         f"Starting: num_steps={num_steps}, num_epochs={num_epochs}, "
         f"steps_per_epoch={steps_per_epoch}, "
-        f"dp_size={dp_size}, per_dp_rank_batch_size={args.per_dp_rank_batch_size}"
+        f"dispatch_batch_size={controller.dispatch_batch_size}"
     )
 
     enable_perf = getattr(args, "enable_perf_metrics", True)
@@ -251,36 +253,33 @@ def training_loop(
     steps_in_current_epoch = completed_steps % steps_per_epoch
     if start_step > 0:
         logger.info(f"Resuming from step {start_step} (epoch {current_epoch})")
-    dispatch_attempts = 0
-    consecutive_failures = 0
     queued_batches = 0
     previous_dispatch_wait: float | None = None
     progress = tqdm(total=num_steps, desc="Running Inference", unit="step", initial=start_step)
     max_attempts_per_step = 100
     for step in range(start_step, num_steps):
-        target_queued_batches = min(prefetch_batches, steps_per_epoch - steps_in_current_epoch)
-        inference_manager_status = asyncio.run(inference_manager.get_status())
+        inference_manager_status = inference_manager.get_status()
         inference_prompt_buffer_size = inference_manager_status["prompt_buffer_size"]
         inference_pending_tasks = inference_manager_status["pending_tasks"]
         drained = inference_prompt_buffer_size == 0 and inference_pending_tasks == 0 and controller.get_pool_size() == 0
+        if drained:
+            logger.info(f"Inference prompt buffer and controller sample pool drained at step {step}")
+            break
         begin_next_epoch = steps_in_current_epoch >= steps_per_epoch and completed_steps < num_steps
-        if drained or begin_next_epoch:
+        if begin_next_epoch:
             current_epoch += 1
             steps_in_current_epoch = 0
-            consecutive_failures = 0
             logger.info(f"Dataset exhausted, reloading (epoch {current_epoch})...")
             controller.reload_dataset()
-        dispatch_attempts = 0
-        dispatched = False
-        while not dispatched and dispatch_attempts < max_attempts_per_step:
-            dispatched = controller.try_dispatch_batch()
-            dispatch_attempts += 1
-        if dispatched:
+        deadline = time.monotonic() + dispatch_timeout_s     # e.g. 600
+        while not controller.try_dispatch_batch():
+            if time.monotonic() > deadline:
+                raise RuntimeError(...)
+        else:
             queued_batches += 1
             completed_steps += 1
             steps_in_current_epoch += 1
             progress.update(1)
-            consecutive_failures = 0
         else:
             raise RuntimeError(
                 f"Failed to dispatch batch after {max_attempts_per_step} attempts "
@@ -332,6 +331,7 @@ def run_training_loop(
         _safe_training_cleanup(
             args=args,
             inference_manager=inference_manager,
+            controller=controller,
             mooncake_master=mooncake_master,
             mooncake_store=mooncake_store,
         )
