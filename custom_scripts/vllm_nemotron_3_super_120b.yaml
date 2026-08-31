@@ -37,6 +37,7 @@ training:
 
 inference:
   inference_engine_type: vllm
+  # TODO: The inference_num parameters are likely unused.
   inference_num_gpus: 2
   inference_num_gpus_per_engine: 1
   inference_num_gpus_per_node: 4
@@ -45,7 +46,7 @@ inference:
   inference_batch_size: 1
   aux_hidden_states_layers: [3, 19, 35]
   vllm:
-    tp_size: 1
+    tp_size: 2
     endpoints: ["http://127.0.0.1:8080"]
     timeout_s: 1800.0
     extra_args:
