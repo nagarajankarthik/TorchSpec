@@ -125,10 +125,8 @@ class MooncakeConfig:
 
         Handles:
         - metadata_server URL construction from metadata_port if metadata_server is not set
-        - local_hostname auto-resolution via RayActor.get_node_ip()
         - Size string parsing (handled automatically by __post_init__)
         """
-        from torchspec.ray.ray_actor import RayActor
 
         master_server_address = getattr(args, "mooncake_master_server_address", None)
         metadata_port = getattr(args, "mooncake_metadata_port", None)
@@ -141,7 +139,7 @@ class MooncakeConfig:
 
         local_hostname = getattr(args, "mooncake_local_hostname", None)
         if local_hostname is None or local_hostname == "localhost":
-            local_hostname = RayActor.get_node_ip()
+            raise ValueError("mooncake_local_hostname must be set")
 
         kwargs = {
             "local_hostname": local_hostname,

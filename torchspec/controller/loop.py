@@ -134,7 +134,7 @@ def _cleanup_old_checkpoints(checkpoint_dir: str | None, max_checkpoints: int) -
 
 
 def _safe_training_cleanup(
-    args, inference_manager, mgr_thread = None, controller = None, mooncake_master = None, mooncake_store = None, inference_future = None, inference_engines=None
+    args, inference_manager, *, mgr_thread = None, controller = None, mooncake_master = None, mooncake_store = None, inference_future = None, inference_engines=None
 ) -> None:
     """Best-effort teardown for inference manager and mooncake master actor."""
     if inference_manager is not None:

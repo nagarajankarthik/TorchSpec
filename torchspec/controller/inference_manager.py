@@ -43,7 +43,7 @@ import asyncio
 import time
 import aiohttp
 from collections import deque
-from typing import Any
+from typing import Any, Optional
 import torch
 
 from torchspec.utils.logging import logger
