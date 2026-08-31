@@ -271,20 +271,17 @@ def training_loop(
             steps_in_current_epoch = 0
             logger.info(f"Dataset exhausted, reloading (epoch {current_epoch})...")
             controller.reload_dataset()
-        deadline = time.monotonic() + dispatch_timeout_s     # e.g. 600
+        deadline = time.monotonic() + 600
         while not controller.try_dispatch_batch():
             if time.monotonic() > deadline:
-                raise RuntimeError(...)
-        else:
-            queued_batches += 1
-            completed_steps += 1
-            steps_in_current_epoch += 1
-            progress.update(1)
-        else:
-            raise RuntimeError(
-                f"Failed to dispatch batch after {max_attempts_per_step} attempts "
-                f"(epoch {current_epoch}, step {completed_steps})"
-            )
+                raise RuntimeError(
+                    f"Failed to dispatch batch after {max_attempts_per_step} attempts "
+                    f"(epoch {current_epoch}, step {completed_steps})"
+                )
+        queued_batches += 1
+        completed_steps += 1
+        steps_in_current_epoch += 1
+        progress.update(1)
         if queued_batches == prefetch_batches or step == num_steps - 1:
             samples_delete = controller.drain_queues(controller.train_queues)
             for sample in samples_delete:
