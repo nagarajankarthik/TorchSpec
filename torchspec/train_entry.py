@@ -379,6 +379,12 @@ def train_async_no_generation(args):
     with timer.phase("Setup async training"):
         inference_manager = AsyncInferenceManager(args, controller, mooncake_config)
 
+    mgr_thread = threading.Thread(
+        target=lambda: asyncio.run(inference_manager.run()),
+        daemon=True, name="inference-manager",
+    )
+    mgr_thread.start()
+
     timer.log_summary()
 
     # [10] Run training loop (no ray.put needed — dataset lives on controller)

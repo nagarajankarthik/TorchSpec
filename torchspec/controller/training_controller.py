@@ -726,6 +726,14 @@ class AsyncTrainingController:
         status.update(self.get_speeds())
         return status
 
+    def drain_pool(self) -> list[InferenceOutput]:
+        with self._pool_lock:
+            leftovers = list(self.sample_pool)
+            self.sample_pool.clear()
+            for r in leftovers:
+                self._pool_bytes -= self._sample_bytes.pop(r.mooncake_key, 0)
+        return leftovers
+
     def shutdown(self) -> None:
         """Signal training workers to stop by sending None to queues."""
         for q in self.train_queues:

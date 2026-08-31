@@ -459,17 +459,17 @@ class AsyncInferenceManager:
             "perf/infer_batch_time": total_time / len(recent),
         }
 
-    async def get_status(self) -> dict:
+    def get_status(self) -> dict:
         """Get current status of inference manager."""
         status = {
             "prompt_buffer_size": len(self._prompt_buffer),
             "running": self._running,
             "pending_tasks": len(self._pending_tasks),
         }
-        status.update(await self.get_pool_status())
+        status.update(self.get_pool_status())
         return status
 
-    async def get_pool_status(self) -> dict:
+    def get_pool_status(self) -> dict:
         """Get current sample pool status."""
         try:
             pool_size = self.controller.get_pool_size()
