@@ -16,7 +16,7 @@ set -euo pipefail
 set -x
 
 if [[ -n "${SLURM_JOB_ID:-}" ]] ; then
-    export BASE_DIR="/mnt/weka/aisg/users/karthik/model_training_team/torchspec_test"
+    export BASE_DIR="/mnt/weka/aisg/users/karthik/model_training_team"
     export JOB_ID=${SLURM_JOB_ID}
     export JOB_NAME=${SLURM_JOB_NAME}
     hosts=$(scontrol show hostnames ${SLURM_JOB_NODELIST})
@@ -37,9 +37,9 @@ export GPUS_PER_NODE=$(nvidia-smi --list-gpus | wc -l)
 export TORCHINDUCTOR_CACHE_DIR="${TMPDIR:-/tmp}/cache/compiled_kernels"
 export TORCHSPEC_LOG_LEVEL=DEBUG
 
-CONFIG_FILE="${1:-${BASE_DIR}/custom_scripts/vllm_nemotron_3_super_120b.yaml}"
+CONFIG_FILE="${1:-${BASE_DIR}/test_torchspec/TorchSpec/custom_scripts/vllm_nemotron_3_super_120b.yaml}"
 
-export LOG_DIR="${BASE_DIR}/logs/${JOB_ID}"
+export LOG_DIR="${BASE_DIR}/test_torchspec/TorchSpec/logs/${JOB_ID}"
 mkdir -p $LOG_DIR
 export MOONCAKE_MASTER_SERVER_ADDRESS="${MASTER_ADDR}"
 export MOONCAKE_ENV_FILE="${LOG_DIR}/mooncake_env.sh"
@@ -49,16 +49,16 @@ if [[ -z "${LOCAL_IP}" ]]; then
     echo "ERROR: could not determine a local IP from 'hostname -I'" >&2
     exit 1
 fi
-# TODO: Update the path to the actual virtual environments in all subsequent commands.
 
 # Export Mooncake environment variables read by vllm connector.
-/path/to/torchspec_env/bin/python3 -m torchspec.mooncake_helper \
+${BASE_DIR}/uv_biome/torchspec/bin/python3 -m torchspec.mooncake_helper \
     --config ${CONFIG_FILE} \
     mooncake.env_file=${MOONCAKE_ENV_FILE} \
     mooncake.local_hostname=${LOCAL_IP}
 
 # Launch mooncake master server. Port numbers here must be consistent with the ones in the config file.
-mooncake_master \
+MOONCAKE_MASTER_PATH=${BASE_DIR}/uv_biome/torchspec/lib/python3.12/site-packages/mooncake/mooncake_master
+${MOONCAKE_MASTER_PATH} \
   --port="8011" \
   --http_metadata_server_port="8012" \
   --http_metadata_server_host=0.0.0.0 \
@@ -87,7 +87,7 @@ done
 # is vllm's reserved post-last-layer / pre-`norm` slot, so training
 # can apply the model's final norm itself on top of this.
 source ${MOONCAKE_ENV_FILE}  
-/path/to/vllm_env/bin/python3 -m vllm.entrypoints.openai.api_server \
+${BASE_DIR}/uv_biome/torchspec/bin/python3 -m vllm.entrypoints.openai.api_server \
     --model nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16 \
     --max-model-len 16384 \
     --gpu-memory-utilization 0.85 \
@@ -115,6 +115,6 @@ done
 echo "vLLM server is ready!"
 
 
-/path/to/torchspec_env/bin/python3 -m torchspec.train_entry \
+${BASE_DIR}/uv_biome/torchspec/bin/python3 -m torchspec.train_entry \
     --config "$CONFIG_FILE" \
     mooncake.local_hostname=${LOCAL_IP}
