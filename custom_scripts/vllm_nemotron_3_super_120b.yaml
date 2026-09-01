@@ -2,9 +2,10 @@
 # Adapted from configs/vllm_qwen3_5_35b.yaml.
 #
 # GPU allocation:
-#   - 2 GPUs for inference (2 inference GPUs total, TP=1 per engine)
-#   - 2 GPUs for training (DP/FSDP across 2 GPUs)
-#   - Total: 4 GPUs
+#   - All node GPUs go to vLLM (TP=4 in launch.sh). ~120B bf16 weights are
+#     ~224GiB, so TP=2 does not fit on 140GiB H200s.
+#   - The torchspec driver in this inference-only mode holds no GPU: its
+#     Mooncake store is created on CPU and no training group is built.
 #
 # Installation:
 #   pip install -e ".[vllm]"  # Install vLLM backend
@@ -61,7 +62,7 @@ inference:
     endpoints: ["http://127.0.0.1:8080"]
     timeout_s: 1800.0
     # Mirrors launch.sh -- not read here.
-    tp_size: 2
+    tp_size: 4
     extra_args:
       max_num_batched_tokens: 65536
       enable_chunked_prefill: true

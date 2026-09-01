@@ -92,10 +92,11 @@ ${BASE_DIR}/uv_biome/torchspec/bin/python3 -m vllm.entrypoints.openai.api_server
     --max-model-len 16384 \
     --gpu-memory-utilization 0.85 \
     --port 8080 \
-    --tensor-parallel-size 2 \
+    --tensor-parallel-size 4 \
     --pipeline-parallel-size 1 \
     --max-num-batched-tokens 65536 \
     --enable-chunked-prefill \
+    --enforce-eager \
     --speculative-config '{"method": "extract_hidden_states", "num_speculative_tokens": 1, "draft_model_config": {"hf_config": {"eagle_aux_hidden_state_layer_ids": [5, 30, 60, 88]}}}' \
     --kv-transfer-config '{"kv_connector": "MooncakeHiddenStatesConnector", "kv_connector_module_path": "torchspec.inference.engine.mooncake_hidden_states_connector", "kv_role": "kv_producer"}' &
 
@@ -105,9 +106,17 @@ trap "kill -TERM $MC_PID $VLLM_PID 2>/dev/null || true" EXIT
 
 # 2. Wait until the vLLM endpoint is live and healthy
 echo "Waiting for vLLM server to start..."
+VLLM_STARTUP_TIMEOUT="${VLLM_STARTUP_TIMEOUT:-3600}"
+VLLM_DEADLINE=$(( SECONDS + VLLM_STARTUP_TIMEOUT ))
 until curl -s http://localhost:8080/health > /dev/null; do
     if ! kill -0 $VLLM_PID 2>/dev/null; then
-        echo "vLLM server failed to start!"
+        echo "vLLM server failed to start!" >&2
+        exit 1
+    fi
+    if (( SECONDS > VLLM_DEADLINE )); then
+        # A hung worker keeps the parent PID alive forever, so without this the
+        # job sits here until walltime. Check the VLLM::Worker_* logs.
+        echo "ERROR: vLLM not healthy after ${VLLM_STARTUP_TIMEOUT}s; check worker logs." >&2
         exit 1
     fi
     sleep 5
