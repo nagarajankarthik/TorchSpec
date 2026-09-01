@@ -129,8 +129,10 @@ class MooncakeConfig:
         """
 
         master_server_address = getattr(args, "mooncake_master_server_address", None)
-        if master_server_addr is None:
-            master_server_addr = os.environ.get("MOONCAKE_MASTER_SERVER_ADDRESS")
+        if master_server_address is None:
+            master_server_address = os.environ.get("MOONCAKE_MASTER_SERVER_ADDRESS")
+        if master_server_address and ":" not in master_server_address:
+            master_server_address = f"{master_server_address}:{getattr(args, 'mooncake_master_port', 50051)}"
         metadata_port = getattr(args, "mooncake_metadata_port", None)
         metadata_server = getattr(args, "mooncake_metadata_server", None)
 

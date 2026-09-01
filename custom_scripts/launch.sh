@@ -34,7 +34,7 @@ elif [[ -n "${PBS_JOBID:-}" ]] ; then
 fi
 
 export GPUS_PER_NODE=$(nvidia-smi --list-gpus | wc -l)
-export TORCHINDUCTOR_CACHE_DIR="${TMPDIR}/cache/compiled_kernels"
+export TORCHINDUCTOR_CACHE_DIR="${TMPDIR:-/tmp}/cache/compiled_kernels"
 export TORCHSPEC_LOG_LEVEL=DEBUG
 
 CONFIG_FILE="${1:-${BASE_DIR}/custom_scripts/vllm_nemotron_3_super_120b.yaml}"
@@ -48,7 +48,8 @@ export MOONCAKE_ENV_FILE="${LOG_DIR}/mooncake_env.sh"
 # Export Mooncake environment variables read by vllm connector.
 /path/to/torchspec_env/bin/python3 -m torchspec.mooncake_helper \
     --config ${CONFIG_FILE} \
-    --mooncake.local_hostname=$(hostname -I | awk '{print $1}') 
+    mooncake.env_file=${MOONCAKE_ENV_FILE} \
+    mooncake.local_hostname=$(hostname -I | awk '{print $1}') 
 
 # Launch mooncake master server. Pot IDs here must be consistent with the ones in the config file.
 mooncake_master \
@@ -59,6 +60,11 @@ mooncake_master \
   --default_kv_lease_ttl=5000 \
   --metrics_port="8013" & MC_PID=$!
 
+trap "kill -TERM $MC_PID 2>/dev/null || true" EXIT
+until timeout 1 bash -c '</dev/tcp/localhost/8011' localhost 8011 && timeout 1 bash -c '</dev/tcp/localhost/8012' localhost 8012; do
+    kill -0 $MC_PID 2>/dev/null || { echo "mooncake_master died"; exit 1; }
+    sleep 1
+done
 
 # 1. Launch vLLM in the background
 # The following comment block in torchspec/inference/engine/vllm_engine should be noted:
@@ -90,10 +96,6 @@ source ${MOONCAKE_ENV_FILE}
 VLLM_PID=$!
 
 trap "kill -TERM $MC_PID $VLLM_PID 2>/dev/null || true" EXIT
-until nc -z localhost 8011 && nc -z localhost 8012; do
-    kill -0 $MC_PID 2>/dev/null || { echo "mooncake_master died"; exit 1; }
-    sleep 1
-done
 
 # 2. Wait until the vLLM endpoint is live and healthy
 echo "Waiting for vLLM server to start..."
@@ -109,6 +111,4 @@ echo "vLLM server is ready!"
 
 /path/to/torchspec_env/bin/python3 -m torchspec.train_entry \
     --config "$CONFIG_FILE" \
-    --mooncake.local_hostname=$(hostname -I | awk '{print $1}') 
-
-
+    mooncake.local_hostname=$(hostname -I | awk '{print $1}') 

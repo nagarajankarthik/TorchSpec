@@ -734,6 +734,7 @@ class AsyncInferenceManager:
 
         if inference_results:
             self.controller.push_inference_results(inference_results)
+            self.controller.clear_inference_error()
             logger.debug(f"Forwarded {len(inference_results)} results to controller")
 
         return len(inference_results)

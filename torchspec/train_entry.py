@@ -366,7 +366,7 @@ def train_async_no_generation(args):
             mooncake_config,
             global_segment_size=0,        # contributes no storage
             async_put_pool_size=0,        # never puts
-            local_buffer_size=64 << 20,   # never gets
+            local_buffer_size="1GB",   # never gets
             enable_gpu_direct=False,      # explicit; also skips the GPU receive buffer
         )
         mooncake_store = EagleMooncakeStore(mooncake_config_store)

@@ -25,6 +25,7 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
+import torch
 
 import ray
 import wandb
@@ -277,10 +278,11 @@ def training_loop(
         logger.info(f"Resuming from step {start_step} (epoch {current_epoch})")
     queued_batches = 0
     progress = tqdm(total=num_steps, desc="Running Inference", unit="step", initial=start_step)
+    verified = False
     for step in range(start_step, num_steps):
         is_pipeline_idle = False
         check_deadline = time.monotonic() + 10
-        while not _pipeline_idle():
+        while _pipeline_idle():
             if time.monotonic() > check_deadline:
                 is_pipeline_idle = True
                 logger.info(f"Inference prompt buffer and controller sample pool drained at step {step}")
@@ -306,11 +308,14 @@ def training_loop(
         progress.update(1)
         if queued_batches == prefetch_batches or step == num_steps - 1:
             samples_delete = controller.drain_queues(controller.train_queues)
-            if step == start_step:
+            if not verified and samples_delete:
                 s = samples_delete[0]
+                dtypes = {k: (getattr(torch, v.replace("torch.", "")) if isinstance(v, str) else v)
+                  for k, v in (s.tensor_dtypes or {}).items()}
                 logger.info("SAMPLE key=%s shapes=%s dtypes=%s", s.mooncake_key, s.tensor_shapes, s.tensor_dtypes)
                 out = mooncake_store.get(s.mooncake_key, s.tensor_shapes, dtypes, torch.device("cpu"))
                 logger.info("ROUNDTRIP hs=%s ids=%s lhs=%s", out.hidden_states.shape, out.input_ids[:8], out.last_hidden_states.shape)
+                verified = True
             for sample in samples_delete:
                 cleanup_mooncake_data(sample, mooncake_store)
             queued_batches = 0

@@ -1,3 +1,4 @@
+import os
 from torchspec.config.train_config import config_to_flat_args, load_config
 from torchspec.config.mooncake_config import MooncakeConfig
 from torchspec.train_entry import parse_config

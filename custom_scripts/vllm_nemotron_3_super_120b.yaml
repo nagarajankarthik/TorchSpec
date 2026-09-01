@@ -32,6 +32,7 @@ dataset:
   defer_tokenization: false
 
 training:
+  num_epochs: 2
   max_seq_length: 16384
   max_concurrent_batches: 32
 

@@ -166,6 +166,7 @@ class AsyncTrainingController:
         self._last_dispatch_log_time = 0.0
         self._inference_error: str | None = None
         self._consecutive_errors: int = 0
+        self._error_lock = threading.Lock()
 
     def _generate_data_id(self) -> str:
         self._data_id_counter += 1
@@ -448,8 +449,14 @@ class AsyncTrainingController:
     # ─────────────────────────────────────────────────────────────
 
     def set_inference_error(self, msg: str) -> None:
-        """Called by the inference manager when a fatal error occurs."""
-        self._inference_error = msg
+        with self._error_lock:
+            self._inference_error = msg
+            self._consecutive_errors += 1
+
+    def clear_inference_error(self) -> None:
+        with self._error_lock:
+            self._inference_error = None
+            self._consecutive_errors = 0
 
     def try_dispatch_batch(self) -> bool:
         """Try to dispatch one batch to training queues.
@@ -464,16 +471,15 @@ class AsyncTrainingController:
         Raises:
             RuntimeError: If the inference manager has reported a fatal error.
         """
-        if self._inference_error is not None:
-            self._consecutive_errors += 1
-            logger.error(f"Inference manager failed: {self._inference_error}")
-            if self._consecutive_errors >= 10:
-                logger.error(
-                    f"Too many consecutive inference manager failures: {self._inference_error}"
-                )
-                raise RuntimeError(f"Inference engine failed: {self._inference_error}")
+        with self._error_lock:
+            if self._inference_error is not None:
+                logger.error(f"Inference manager failed: {self._inference_error}")
+                if self._consecutive_errors >= 10:
+                    logger.error(
+                        f"Too many consecutive inference manager failures: {self._inference_error}"
+                    )
+                    raise RuntimeError(f"Inference engine failed: {self._inference_error}")
 
-        self._consecutive_errors = 0
         with self._pool_lock:
             pool_size = len(self.sample_pool)
             now = time.time()
