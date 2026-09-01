@@ -129,6 +129,8 @@ class MooncakeConfig:
         """
 
         master_server_address = getattr(args, "mooncake_master_server_address", None)
+        if master_server_addr is None:
+            master_server_addr = os.environ.get("MOONCAKE_MASTER_SERVER_ADDRESS")
         metadata_port = getattr(args, "mooncake_metadata_port", None)
         metadata_server = getattr(args, "mooncake_metadata_server", None)
 
@@ -165,7 +167,7 @@ class MooncakeConfig:
                 getattr(args, "max_seq_length", 8192),
             ),
             "hidden_dim": getattr(args, "mooncake_hidden_dim", 4096),
-            "num_aux_layers": cls._infer_num_aux_layers(args),
+            "num_aux_layers": getattr(args, "mooncake_num_aux_layers", None) or cls._infer_num_aux_layers(args),
         }
 
         if metadata_server is not None:

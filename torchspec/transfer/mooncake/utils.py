@@ -272,6 +272,8 @@ def launch_mooncake_master(args):
 
     master_addr = getattr(args, "mooncake_master_server_address", None)
     if master_addr is None:
+        master_addr = os.environ.get("MOONCAKE_MASTER_SERVER_ADDRESS")
+    if master_addr is None:
         logger.error(
                 "Missing mooncake_master_server_address. "
                 )

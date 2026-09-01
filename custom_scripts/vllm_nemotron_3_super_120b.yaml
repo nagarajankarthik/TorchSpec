@@ -35,16 +35,17 @@ training:
   max_seq_length: 16384
   max_concurrent_batches: 32
 
+# TODO: Only max_sample_pool_size, inference_buffer_threshold, and inference_batch_size are used.
+# Remove the rest upon confirming that they are not read.
 inference:
   inference_engine_type: vllm
-  # TODO: The inference_num parameters are likely unused.
   inference_num_gpus: 2
   inference_num_gpus_per_engine: 1
   inference_num_gpus_per_node: 4
   max_sample_pool_size: 64
   inference_buffer_threshold: 32
   inference_batch_size: 1
-  aux_hidden_states_layers: [3, 19, 35]
+  aux_hidden_states_layers: [4, 29, 59]
   vllm:
     tp_size: 2
     endpoints: ["http://127.0.0.1:8080"]
@@ -60,11 +61,13 @@ mooncake:
   device_name: mlx5_0
   hidden_dim: 4096
   max_seq_len: 16384
+  num_aux_layers: 3
   global_segment_size: 64GB
   local_buffer_size: 8GB
   master_server_address: null
+  master_port: 8011
   metadata_server: null
-  metadata_port: 8090
+  metadata_port: 8012
 
 output_dir: ./outputs/nemotron_3_120b_test
 cache_dir: ./cache/nemotron_3_120b_test

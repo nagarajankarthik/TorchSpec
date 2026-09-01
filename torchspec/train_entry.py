@@ -51,7 +51,7 @@ from torchspec.controller import (
 )
 from torchspec.controller.inference_manager import AsyncInferenceManager
 from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
-from torchspec.transfer.mooncake.utils import launch_mooncake_master
+from torchspec.transfer.mooncake.utils import launch_mooncake_master, check_mooncake_master_available
 from torchspec.utils.logging import init_tracking, logger
 
 _Phase = namedtuple("_Phase", ["name", "duration", "is_async", "blocked"])
@@ -360,8 +360,8 @@ def train_async_no_generation(args):
     # [4] Continue with initialization sequentially.
     mooncake_master = None
     with timer.phase("Driver-side init"):
-        mooncake_master = launch_mooncake_master(args)
         mooncake_config = build_mooncake_config(args)
+        check_mooncake_master_available(mooncake_config.master_server_address, mooncake_config.metadata_server)
         mooncake_config_store = dataclasses.replace(
             mooncake_config,
             global_segment_size=0,        # contributes no storage

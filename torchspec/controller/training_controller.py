@@ -165,6 +165,7 @@ class AsyncTrainingController:
         self._training_monitor = SpeedMonitor(window_seconds=10.0)
         self._last_dispatch_log_time = 0.0
         self._inference_error: str | None = None
+        self._consecutive_errors: int = 0
 
     def _generate_data_id(self) -> str:
         self._data_id_counter += 1
@@ -464,8 +465,15 @@ class AsyncTrainingController:
             RuntimeError: If the inference manager has reported a fatal error.
         """
         if self._inference_error is not None:
-            raise RuntimeError(f"Inference engine failed: {self._inference_error}")
+            self._consecutive_errors += 1
+            logger.error(f"Inference manager failed: {self._inference_error}")
+            if self._consecutive_errors >= 10:
+                logger.error(
+                    f"Too many consecutive inference manager failures: {self._inference_error}"
+                )
+                raise RuntimeError(f"Inference engine failed: {self._inference_error}")
 
+        self._consecutive_errors = 0
         with self._pool_lock:
             pool_size = len(self.sample_pool)
             now = time.time()

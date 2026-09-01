@@ -312,7 +312,6 @@ class VLLMClient:
             "temperature": temperature,
             "top_p": top_p,
             "return_token_ids": True,           # need ids back, not text
-            "kv_transfer_params": True,
         }
         if seed is not None:
             payload["seed"] = seed
@@ -416,6 +415,7 @@ class AsyncInferenceManager:
         except asyncio.CancelledError:
             pass
         await self._drain()
+        await self._vllm_client.shutdown()
         logger.info("AsyncInferenceManager stopped")
 
     async def _continuous_refill(self) -> None:
@@ -664,12 +664,14 @@ class AsyncInferenceManager:
                     f"{len(entries)} entries (expected equal)"
                 )
                 err = ValueError(f"output count mismatch: {len(outputs)} vs {len(entries)}")
+                self.controller.set_inference_error(str(err))
                 return [(entry, err) for entry in entries]
             return list(zip(entries, outputs, strict=True))
         except Exception as e:
             import traceback
 
             logger.error(f"Engine dispatch failed: {e}\n{traceback.format_exc()}")
+            self.controller.set_inference_error(str(e))
             return [(entry, e) for entry in entries]
 
     # -- Result processing ---------------------------------------------------

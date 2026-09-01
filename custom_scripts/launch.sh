@@ -1,11 +1,16 @@
 #!/bin/bash
 # Script used to run custom TorchSpec code. Adapted from examples/qwen3-8b-single-node/run.sh
 #
-# SBATCH --job-name=torchspec_infer
-# SBATCH --nodes=1
-# SBATCH --ntasks-per-node=1
-# SBATCH --gres=gpu:8
-# SBATCH --cpus-per-gpu=16
+#SBATCH --job-name=torchspec_infer
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:8
+#SBATCH --cpus-per-gpu=16
+#SBATCH --ignore-pbs
+
+#PBS -N torchspec_infer
+#PBS -l select=1:ncpus=128:ngpus=8
+#PBS -l walltime=12:00:00
 
 set -euo pipefail
 set -x
@@ -29,17 +34,34 @@ elif [[ -n "${PBS_JOBID:-}" ]] ; then
 fi
 
 export GPUS_PER_NODE=$(nvidia-smi --list-gpus | wc -l)
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
-ROOT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
-export TORCHINDUCTOR_CACHE_DIR="$ROOT_DIR/cache/compiled_kernels"
-export TORCHSPEC_LOG_LEVEL=INFO
+export TORCHINDUCTOR_CACHE_DIR="${TMPDIR}/cache/compiled_kernels"
+export TORCHSPEC_LOG_LEVEL=DEBUG
 
-CONFIG_FILE="${1:-$ROOT_DIR/custom_scripts/vllm_nemotron_3_super_120b.yaml}"
+CONFIG_FILE="${1:-${BASE_DIR}/custom_scripts/vllm_nemotron_3_super_120b.yaml}"
 
-# TODO: Update the path to the actual virtual environment.
+export LOG_DIR="${BASE_DIR}/logs/${JOB_ID}"
+mkdir -p $LOG_DIR
+export MOONCAKE_MASTER_SERVER_ADDRESS="${MASTER_ADDR}" 
+export MOONCAKE_ENV_FILE="${LOG_DIR}/mooncake_env.sh"
+# TODO: Update the path to the actual virtual environments in all subsequent commands.
+
+# Export Mooncake environment variables read by vllm connector.
+/path/to/torchspec_env/bin/python3 -m torchspec.mooncake_helper \
+    --config ${CONFIG_FILE} \
+    --mooncake.local_hostname=$(hostname -I | awk '{print $1}') 
+
+# Launch mooncake master server. Pot IDs here must be consistent with the ones in the config file.
+mooncake_master \
+  --port="8011" \
+  --http_metadata_server_port="8012" \
+  --http_metadata_server_host=0.0.0.0 \
+  --enable_http_metadata_server=true \
+  --default_kv_lease_ttl=5000 \
+  --metrics_port="8013" & MC_PID=$!
+
 
 # 1. Launch vLLM in the background
-# THe following comment block in torchspec/inference/engine/vllm_engine should be noted:
+# The following comment block in torchspec/inference/engine/vllm_engine should be noted:
 # Layer IDs use post-layer semantics: "capture the residual stream
 # after layer N runs".  vllm's capture hook fires at the INPUT of each
 # listed layer (= output of the previous layer), so we shift by +1 to
@@ -52,8 +74,11 @@ CONFIG_FILE="${1:-$ROOT_DIR/custom_scripts/vllm_nemotron_3_super_120b.yaml}"
 # (pre-norm) for target logit computation.  Index `num_hidden_layers`
 # is vllm's reserved post-last-layer / pre-`norm` slot, so training
 # can apply the model's final norm itself on top of this.
-/path/to/env/bin/python -m vllm.entrypoints.openai.api_server \
+source ${MOONCAKE_ENV_FILE}  
+/path/to/vllm_env/bin/python3 -m vllm.entrypoints.openai.api_server \
     --model nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16 \
+    --max-model-len 16384 \
+    --gpu-memory-utilization 0.85 \
     --port 8080 \
     --tensor-parallel-size 2 \
     --pipeline-parallel-size 1 \
@@ -64,8 +89,11 @@ CONFIG_FILE="${1:-$ROOT_DIR/custom_scripts/vllm_nemotron_3_super_120b.yaml}"
 
 VLLM_PID=$!
 
-# Ensure vLLM is killed when the script exits or terminates
-trap "kill -9 $VLLM_PID 2>/dev/null || true" EXIT
+trap "kill -TERM $MC_PID $VLLM_PID 2>/dev/null || true" EXIT
+until nc -z localhost 8011 && nc -z localhost 8012; do
+    kill -0 $MC_PID 2>/dev/null || { echo "mooncake_master died"; exit 1; }
+    sleep 1
+done
 
 # 2. Wait until the vLLM endpoint is live and healthy
 echo "Waiting for vLLM server to start..."
@@ -79,10 +107,8 @@ done
 echo "vLLM server is ready!"
 
 
-
-
-python3 -m torchspec.train_entry \
+/path/to/torchspec_env/bin/python3 -m torchspec.train_entry \
     --config "$CONFIG_FILE" \
-    "$@"
+    --mooncake.local_hostname=$(hostname -I | awk '{print $1}') 
 
 
