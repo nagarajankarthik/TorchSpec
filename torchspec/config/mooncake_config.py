@@ -145,6 +145,12 @@ class MooncakeConfig:
         if local_hostname is None or local_hostname == "localhost":
             raise ValueError("mooncake_local_hostname must be set")
 
+        # An explicit mooncake.num_aux_layers wins; only fall back to counting
+        # inference.aux_hidden_states_layers when it is genuinely unset.
+        num_aux_layers = getattr(args, "mooncake_num_aux_layers", None)
+        if num_aux_layers is None:
+            num_aux_layers = cls._infer_num_aux_layers(args)
+
         kwargs = {
             "local_hostname": local_hostname,
             "master_server_address": master_server_address or "localhost:50051",
@@ -169,7 +175,7 @@ class MooncakeConfig:
                 getattr(args, "max_seq_length", 8192),
             ),
             "hidden_dim": getattr(args, "mooncake_hidden_dim", 4096),
-            "num_aux_layers": getattr(args, "mooncake_num_aux_layers", None) or cls._infer_num_aux_layers(args),
+            "num_aux_layers": num_aux_layers,
         }
 
         if metadata_server is not None:

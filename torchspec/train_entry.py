@@ -51,7 +51,7 @@ from torchspec.controller import (
 )
 from torchspec.controller.inference_manager import AsyncInferenceManager
 from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
-from torchspec.transfer.mooncake.utils import launch_mooncake_master, check_mooncake_master_available
+from torchspec.transfer.mooncake.utils import check_mooncake_master_available
 from torchspec.utils.logging import init_tracking, logger
 
 _Phase = namedtuple("_Phase", ["name", "duration", "is_async", "blocked"])
@@ -100,7 +100,7 @@ class _InitTimer:
         logger.info("\n".join(lines))
 
 
-def parse_config():
+def parse_config(save_snapshot: bool = True):
     """Parse YAML config and convert to flat args.
 
     Supports configs with sections matching the Config dataclass:
@@ -119,7 +119,7 @@ def parse_config():
     args, unknown = parser.parse_known_args()
 
     config = load_config(
-        config_path=args.config, cli_args=unknown if unknown else None, save_snapshot=True
+        config_path=args.config, cli_args=unknown if unknown else None, save_snapshot=save_snapshot
     )
 
     logger.info("Resolved config:\n%s", OmegaConf.to_yaml(config))

@@ -21,7 +21,6 @@
 import atexit
 import ctypes
 import os
-import random
 import shutil
 import signal
 import socket
@@ -30,10 +29,6 @@ import threading
 import time
 from urllib.parse import urlparse
 
-import ray
-
-from torchspec.ray.ray_actor import RayActor
-from torchspec.utils.env import get_torchspec_env_vars
 from torchspec.utils.logging import logger
 
 

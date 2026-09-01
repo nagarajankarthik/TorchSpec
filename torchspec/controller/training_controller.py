@@ -166,6 +166,7 @@ class AsyncTrainingController:
         self._last_dispatch_log_time = 0.0
         self._inference_error: str | None = None
         self._consecutive_errors: int = 0
+        self._last_error_log_time = 0.0
         self._error_lock = threading.Lock()
 
     def _generate_data_id(self) -> str:
@@ -473,12 +474,20 @@ class AsyncTrainingController:
         """
         with self._error_lock:
             if self._inference_error is not None:
-                logger.error(f"Inference manager failed: {self._inference_error}")
                 if self._consecutive_errors >= 10:
                     logger.error(
                         f"Too many consecutive inference manager failures: {self._inference_error}"
                     )
                     raise RuntimeError(f"Inference engine failed: {self._inference_error}")
+                # The caller polls this at ~20Hz, so log at most once every 2s
+                # (matching the pool-size log below) instead of once per poll.
+                now = time.time()
+                if now - self._last_error_log_time >= 2.0:
+                    self._last_error_log_time = now
+                    logger.error(
+                        f"Inference manager failed ({self._consecutive_errors}/10): "
+                        f"{self._inference_error}"
+                    )
 
         with self._pool_lock:
             pool_size = len(self.sample_pool)

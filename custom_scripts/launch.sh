@@ -41,17 +41,23 @@ CONFIG_FILE="${1:-${BASE_DIR}/custom_scripts/vllm_nemotron_3_super_120b.yaml}"
 
 export LOG_DIR="${BASE_DIR}/logs/${JOB_ID}"
 mkdir -p $LOG_DIR
-export MOONCAKE_MASTER_SERVER_ADDRESS="${MASTER_ADDR}" 
+export MOONCAKE_MASTER_SERVER_ADDRESS="${MASTER_ADDR}"
 export MOONCAKE_ENV_FILE="${LOG_DIR}/mooncake_env.sh"
+
+LOCAL_IP=$(hostname -I | awk '{print $1}')
+if [[ -z "${LOCAL_IP}" ]]; then
+    echo "ERROR: could not determine a local IP from 'hostname -I'" >&2
+    exit 1
+fi
 # TODO: Update the path to the actual virtual environments in all subsequent commands.
 
 # Export Mooncake environment variables read by vllm connector.
 /path/to/torchspec_env/bin/python3 -m torchspec.mooncake_helper \
     --config ${CONFIG_FILE} \
     mooncake.env_file=${MOONCAKE_ENV_FILE} \
-    mooncake.local_hostname=$(hostname -I | awk '{print $1}') 
+    mooncake.local_hostname=${LOCAL_IP}
 
-# Launch mooncake master server. Pot IDs here must be consistent with the ones in the config file.
+# Launch mooncake master server. Port numbers here must be consistent with the ones in the config file.
 mooncake_master \
   --port="8011" \
   --http_metadata_server_port="8012" \
@@ -61,7 +67,7 @@ mooncake_master \
   --metrics_port="8013" & MC_PID=$!
 
 trap "kill -TERM $MC_PID 2>/dev/null || true" EXIT
-until timeout 1 bash -c '</dev/tcp/localhost/8011' localhost 8011 && timeout 1 bash -c '</dev/tcp/localhost/8012' localhost 8012; do
+until timeout 1 bash -c '</dev/tcp/localhost/8011' && timeout 1 bash -c '</dev/tcp/localhost/8012'; do
     kill -0 $MC_PID 2>/dev/null || { echo "mooncake_master died"; exit 1; }
     sleep 1
 done
@@ -111,4 +117,4 @@ echo "vLLM server is ready!"
 
 /path/to/torchspec_env/bin/python3 -m torchspec.train_entry \
     --config "$CONFIG_FILE" \
-    mooncake.local_hostname=$(hostname -I | awk '{print $1}') 
+    mooncake.local_hostname=${LOCAL_IP}

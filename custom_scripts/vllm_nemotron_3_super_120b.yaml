@@ -36,21 +36,32 @@ training:
   max_seq_length: 16384
   max_concurrent_batches: 32
 
-# TODO: Only max_sample_pool_size, inference_buffer_threshold, and inference_batch_size are used.
-# Remove the rest upon confirming that they are not read.
+# Read by this path (train_entry -> AsyncInferenceManager -> VLLMClient):
+#   inference_engine_type, max_sample_pool_size, inference_buffer_threshold,
+#   inference_batch_size, aux_hidden_states_layers, vllm.endpoints, vllm.timeout_s
+# Also read but not set here: inference_fetch_batch (defaults to 1).
+#
+# Removed (per the old TODO, now confirmed unread on this path): inference_num_gpus,
+# inference_num_gpus_per_engine, inference_num_gpus_per_node -- these only fed the
+# Ray placement groups, which we no longer use.
+#
+# vllm.tp_size and vllm.extra_args are likewise unread here (they belong to the
+# Ray-managed VllmEngine); they are kept only as documentation of the
+# `vllm serve` invocation in launch.sh and must be kept in sync with it by hand.
 inference:
   inference_engine_type: vllm
-  inference_num_gpus: 2
-  inference_num_gpus_per_engine: 1
-  inference_num_gpus_per_node: 4
   max_sample_pool_size: 64
   inference_buffer_threshold: 32
   inference_batch_size: 1
+  # Post-layer semantics. launch.sh must pass [id + 1 for id in this list] plus
+  # the model's num_hidden_layers (88) as eagle_aux_hidden_state_layer_ids,
+  # i.e. [5, 30, 60, 88]. len(this list) must equal mooncake.num_aux_layers.
   aux_hidden_states_layers: [4, 29, 59]
   vllm:
-    tp_size: 2
     endpoints: ["http://127.0.0.1:8080"]
     timeout_s: 1800.0
+    # Mirrors launch.sh -- not read here.
+    tp_size: 2
     extra_args:
       max_num_batched_tokens: 65536
       enable_chunked_prefill: true

@@ -449,12 +449,10 @@ class AsyncInferenceManager:
         if not recent:
             return {}
 
-        total_samples = sum(samples for samples, _ in recent)
         total_time = sum(elapsed for _, elapsed in recent)
         if total_time <= 0.001:
             return {}
 
-        per_slot_rate = total_samples / total_time
         return {
             "perf/infer_batch_time": total_time / len(recent),
         }
