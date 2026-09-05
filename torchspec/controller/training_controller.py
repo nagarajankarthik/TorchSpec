@@ -113,6 +113,7 @@ class SpeedMonitor:
 @dataclass
 class MooncakeEntry:
     inserted_at: float
+    dispatched_at: float | None
     num_bytes: int
     has_last_hidden_states: bool
     has_target: bool
@@ -425,8 +426,12 @@ class AsyncTrainingController:
         pool_bytes = 0
         if train_results:
             if not self.verified_tensor_shapes:
-                self._verify_tensor_shapes(train_results[0])
                 self.verified_tensor_shapes = True
+                try:
+                    self._verify_tensor_shapes(train_results[0])
+                except Exception:
+                    logger.exception("Round-trip verification failed for %s", train_results[0].mooncake_key)
+                    self.set_inference_error("mooncake round-trip verification failed")
 
             with self._pool_lock:
                 for result in train_results:
@@ -439,6 +444,7 @@ class AsyncTrainingController:
                     shapes = result.tensor_shapes or {}
                     mooncake_entry = MooncakeEntry(
                             inserted_at=time.time(),
+                            dispatched_at=None,
                             num_bytes=sample_bytes,
                             has_last_hidden_states="last_hidden_states" in shapes,
                             has_target="target" in shapes,
@@ -551,6 +557,9 @@ class AsyncTrainingController:
                 result = self.sample_pool.popleft()
                 sample_bytes = self._sample_bytes.pop(result.mooncake_key, 0)
                 self._pool_bytes -= sample_bytes
+                entry = self._mooncake_entries.get(result.mooncake_key)
+                if entry is not None:
+                    entry.dispatched_at = time.time()      # TTL runs from dispatch, not arrival
                 batch_results.append(result)
 
         self._dispatch_to_queues(batch_results, self.train_queues)
@@ -656,37 +665,70 @@ class AsyncTrainingController:
         logger.info("ROUNDTRIP hs=%s lhs=%s", out.hidden_states.shape, out.last_hidden_states.shape)
 
 
-    def _eviction_loop(self):
-        while not self._eviction_stop.wait(self._eviction_interval):
-            now = time.time()
-            with self._pool_lock:
-                expired = [
-                    (k, e) for k, e in self._mooncake_entries.items()
-                    if now - e.inserted_at >= self._eviction_ttl and 
-                    k not in self._sample_bytes
-                ]
-                for k, e in expired:
-                    del self._mooncake_entries[k]
-                    self._mooncake_bytes -= e.num_bytes
-            if expired:
-                logger.info("Evicted %d entries, %.2f GiB resident", len(expired), self._mooncake_bytes / 1024**3)
-            # Do the actual store removal *outside* the lock — it can block on
-            # Mooncake and we don't want to stall push_inference_results.
+    def _eviction_sweep(self) -> None:
+        """One eviction pass: drop expired entries, then delete them from Mooncake.
+
+        An entry is expired once it has left the sample pool (so a trainer has
+        actually been handed the key) and has been dispatched for longer than
+        ``_eviction_ttl``.
+        """
+        now = time.time()
+        with self._pool_lock:
+            expired = [
+                (k, e) for k, e in self._mooncake_entries.items()
+                if k not in self._sample_bytes
+                and e.dispatched_at is not None
+                and now - e.dispatched_at >= self._eviction_ttl
+            ]
             for k, e in expired:
-                try:
-                    self._mooncake_store.remove_eagle3_tensors(
-                        k,
-                        has_last_hidden_states=e.has_last_hidden_states,
-                        has_target=e.has_target,
-                        raise_on_failure=True
+                del self._mooncake_entries[k]
+                self._mooncake_bytes -= e.num_bytes
+        if expired:
+            logger.info("Evicted %d entries, %.2f GiB resident", len(expired), self._mooncake_bytes / 1024**3)
+        # Do the actual store removal *outside* the lock — it can block on
+        # Mooncake and we don't want to stall push_inference_results.
+        for k, e in expired:
+            try:
+                self._mooncake_store.remove_eagle3_tensors(
+                    k,
+                    has_last_hidden_states=e.has_last_hidden_states,
+                    has_target=e.has_target,
+                    raise_on_failure=True
+                )
+            except Exception:
+                logger.exception("Eviction sweep failed for %s", k)
+                # If deletion fails, restore the entry to the dict so
+                # that it will be retried on the next eviction sweep.
+                with self._pool_lock:
+                    self._mooncake_entries[k] = e
+                    self._mooncake_bytes += e.num_bytes
+
+    def _eviction_loop(self):
+        """Sweep until stopped, surviving any failure in a single sweep.
+
+        This runs on a daemon thread, so an escaping exception would kill it
+        silently and stop eviction for the rest of the run — which surfaces
+        much later as a Mooncake watermark that never recedes and generation
+        paused indefinitely. Failures are throttled rather than logged every
+        interval, since a persistent fault would otherwise flood the log.
+        """
+        consecutive_failures = 0
+        last_failure_log = 0.0
+        while not self._eviction_stop.wait(self._eviction_interval):
+            try:
+                self._eviction_sweep()
+                consecutive_failures = 0
+            except Exception:
+                consecutive_failures += 1
+                now = time.monotonic()
+                if now - last_failure_log >= 30.0:
+                    last_failure_log = now
+                    logger.exception(
+                        "Eviction sweep raised (%d consecutive failures); "
+                        "retrying every %.1fs",
+                        consecutive_failures,
+                        self._eviction_interval,
                     )
-                except Exception:
-                    logger.exception("Eviction sweep failed for %s", k)
-                    # If deletion fails, restore the entry to the dict so 
-                    # that it will be retried on the next eviction sweep.
-                    with self._pool_lock:
-                        self._mooncake_entries[k] = e
-                        self._mooncake_bytes += e.num_bytes
 
     def start_eviction_sweeper(self):
         if self._mooncake_store is None:
