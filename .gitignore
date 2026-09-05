@@ -87,6 +87,7 @@ running_logs/
 _sglang/
 _tokenspeed/
 wandb/log.txt
+logs/
 
 .claude/
 wandb/
