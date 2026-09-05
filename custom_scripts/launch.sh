@@ -9,14 +9,17 @@
 #SBATCH --ignore-pbs
 
 #PBS -N torchspec_infer
-#PBS -l select=1:ncpus=128:ngpus=8
-#PBS -l walltime=12:00:00
+#PBS -l select=1:ncpus=64:ngpus=4
+#PBS -l walltime=24:00:00
+#PBS -j oe
+#PBS -q AISG_debug
+#PBS -o /scratch_aisg/scratch_aisg/karthik/model_training_team/TorchSpec/logs/
 
+source ~/.bashrc
 set -euo pipefail
 set -x
 
 if [[ -n "${SLURM_JOB_ID:-}" ]] ; then
-    export BASE_DIR="/mnt/weka/aisg/users/karthik/model_training_team"
     export JOB_ID=${SLURM_JOB_ID}
     export JOB_NAME=${SLURM_JOB_NAME}
     hosts=$(scontrol show hostnames ${SLURM_JOB_NODELIST})
@@ -24,7 +27,6 @@ if [[ -n "${SLURM_JOB_ID:-}" ]] ; then
     export NUM_NODES=${SLURM_JOB_NUM_NODES}
     echo "Running on SLURM cluster."
 elif [[ -n "${PBS_JOBID:-}" ]] ; then
-    export BASE_DIR="/data/projects/51401024"
     export JOB_ID=${PBS_JOBID}
     export JOB_NAME=${PBS_JOBNAME}
     hosts=$(cat $PBS_NODEFILE)
@@ -37,9 +39,13 @@ export GPUS_PER_NODE=$(nvidia-smi --list-gpus | wc -l)
 export TORCHINDUCTOR_CACHE_DIR="${TMPDIR:-/tmp}/cache/compiled_kernels"
 export TORCHSPEC_LOG_LEVEL=DEBUG
 
-CONFIG_FILE="${1:-${BASE_DIR}/test_torchspec/TorchSpec/custom_scripts/vllm_nemotron_3_super_120b.yaml}"
+cd ${BASE_DIR}/TorchSpec
+export PYTHONPATH=${BASE_DIR}/TorchSpec
+module load cuda/13.0
 
-export LOG_DIR="${BASE_DIR}/test_torchspec/TorchSpec/logs/${JOB_ID}"
+CONFIG_FILE="${1:-${BASE_DIR}/TorchSpec/custom_scripts/vllm_nemotron_3_super_120b.yaml}"
+
+export LOG_DIR="${BASE_DIR}/TorchSpec/logs/${JOB_ID}"
 mkdir -p $LOG_DIR
 export MOONCAKE_MASTER_SERVER_ADDRESS="${MASTER_ADDR}"
 export MOONCAKE_ENV_FILE="${LOG_DIR}/mooncake_env.sh"
@@ -106,6 +112,7 @@ trap "kill -TERM $MC_PID $VLLM_PID 2>/dev/null || true" EXIT
 
 # 2. Wait until the vLLM endpoint is live and healthy
 echo "Waiting for vLLM server to start..."
+export VLLM_STARTUP_TIMEOUT=7200
 VLLM_STARTUP_TIMEOUT="${VLLM_STARTUP_TIMEOUT:-3600}"
 VLLM_DEADLINE=$(( SECONDS + VLLM_STARTUP_TIMEOUT ))
 until curl -s http://localhost:8080/health > /dev/null; do
