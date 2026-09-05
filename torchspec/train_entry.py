@@ -373,6 +373,7 @@ def train_async_no_generation(args):
         mooncake_store.setup(device=torch.device("cpu"))
 
 
+    controller.set_mooncake_store(mooncake_store)
     # [5] Auto-calculate training steps (needs dataset_size)
     with timer.phase("Auto-calculate training steps"):
         auto_calculate_training_steps(args, dataset_size)

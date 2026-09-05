@@ -53,6 +53,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+import torch
 
 from queue import Queue
 
@@ -179,10 +180,11 @@ class AsyncTrainingController:
         self._consecutive_errors: int = 0
         self._last_error_log_time = 0.0
         self._error_lock = threading.Lock()
-        self._eviction_ttl = getattr(args, "sample_eviction_ttl_seconds", 60.0)
-        self._eviction_interval = getattr(args, "sample_eviction_check_interval", 1.0)
+        self._eviction_ttl = getattr(args, "mooncake_sample_eviction_ttl_seconds", 60.0)
+        self._eviction_interval = getattr(args, "mooncake_sample_eviction_check_interval", 1.0)
         self._eviction_stop = threading.Event()
         self._eviction_thread: threading.Thread | None = None
+        self.verified_tensor_shapes = False
 
 
     def set_mooncake_store(self, mooncake_store):
@@ -422,6 +424,10 @@ class AsyncTrainingController:
 
         pool_bytes = 0
         if train_results:
+            if not self.verified_tensor_shapes:
+                self._verify_tensor_shapes(train_results[0])
+                self.verified_tensor_shapes = True
+
             with self._pool_lock:
                 for result in train_results:
                     sample_bytes = estimate_tensor_bytes(
@@ -430,6 +436,15 @@ class AsyncTrainingController:
                     )
                     self._sample_bytes[result.mooncake_key] = sample_bytes
                     self._pool_bytes += sample_bytes
+                    shapes = result.tensor_shapes or {}
+                    mooncake_entry = MooncakeEntry(
+                            inserted_at=time.time(),
+                            num_bytes=sample_bytes,
+                            has_last_hidden_states="last_hidden_states" in shapes,
+                            has_target="target" in shapes,
+                    )
+                    self._mooncake_entries[result.mooncake_key] = mooncake_entry
+                    self._mooncake_bytes += sample_bytes
                 self.sample_pool.extend(train_results)
                 pool_bytes = self._pool_bytes
 
@@ -536,15 +551,6 @@ class AsyncTrainingController:
                 result = self.sample_pool.popleft()
                 sample_bytes = self._sample_bytes.pop(result.mooncake_key, 0)
                 self._pool_bytes -= sample_bytes
-                shapes = result.tensor_shapes or {}
-                mooncake_entry = MooncakeEntry(
-                        inserted_at=time.time(),
-                        num_bytes=sample_bytes,
-                        has_last_hidden_states="last_hidden_states" in shapes,
-                        has_target="target" in shapes,
-                )
-                self._mooncake_entries[result.mooncake_key] = mooncake_entry
-                self._mooncake_bytes += sample_bytes
                 batch_results.append(result)
 
         self._dispatch_to_queues(batch_results, self.train_queues)
@@ -641,6 +647,15 @@ class AsyncTrainingController:
         return self.push_inference_results([sample])
 
 
+    def _verify_tensor_shapes(self, result: InferenceOutput):
+        shapes = result.tensor_shapes or {}
+        mooncake_key = result.mooncake_key
+        dtypes = {k: (getattr(torch, v.replace("torch.", "")) if isinstance(v, str) else v) for k, v in (result.tensor_dtypes or {}).items()}
+        logger.info("SAMPLE hs=%s lhs=%s", shapes.get("hidden_states"), shapes.get("last_hidden_states"))
+        out = self._mooncake_store.get(mooncake_key, shapes, dtypes, torch.device("cpu"))
+        logger.info("ROUNDTRIP hs=%s lhs=%s", out.hidden_states.shape, out.last_hidden_states.shape)
+
+
     def _eviction_loop(self):
         while not self._eviction_stop.wait(self._eviction_interval):
             now = time.time()
@@ -663,6 +678,10 @@ class AsyncTrainingController:
                     )
                 except Exception:
                     logger.exception("Eviction sweep failed for %s", k)
+                    # If deletion fails, restore the entry to the dict so 
+                    # that it will be retried on the next eviction sweep.
+                    self._mooncake_entries[k] = e
+                    self._mooncake_bytes += e.num_bytes
 
     def start_eviction_sweeper(self):
         if self._mooncake_store is None:
@@ -824,6 +843,23 @@ class AsyncTrainingController:
 
     def shutdown(self) -> None:
         """Signal training workers to stop by sending None to queues."""
+        self._eviction_stop.set()
+        if self._eviction_thread:
+            self._eviction_thread.join(timeout=10)
+# Final sweep regardless of age
+        with self._pool_lock:
+            stragglers = list(self._mooncake_entries.items())
+            self._mooncake_entries.clear()
+            self._mooncake_bytes = 0
+        for k, e in stragglers:
+            try:
+                self._mooncake_store.remove_eagle3_tensors(
+                    k, has_last_hidden_states=e.has_last_hidden_states,
+                    has_target=e.has_target)
+            except Exception:
+                logger.exception("Final eviction failed for %s", k)
+
+
         for q in self.train_queues:
             q.put(None)
         logger.info("Controller shutdown: sent stop signals to training queues")

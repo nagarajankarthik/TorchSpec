@@ -276,9 +276,8 @@ def training_loop(
     steps_in_current_epoch = completed_steps % steps_per_epoch
     if start_step > 0:
         logger.info(f"Resuming from step {start_step} (epoch {current_epoch})")
-    queued_batches = 0
     progress = tqdm(total=num_steps, desc="Running Inference", unit="step", initial=start_step)
-    verified = False
+    controller.start_eviction_sweeper()
     for step in range(start_step, num_steps):
         is_pipeline_idle = False
         check_deadline = time.monotonic() + 10
@@ -302,23 +301,9 @@ def training_loop(
                     f"(epoch {current_epoch}, step {completed_steps})"
                 )
             time.sleep(0.05)
-        queued_batches += 1
         completed_steps += 1
         steps_in_current_epoch += 1
         progress.update(1)
-        if queued_batches == prefetch_batches or step == num_steps - 1:
-            samples_delete = controller.drain_queues(controller.train_queues)
-            if not verified and samples_delete:
-                s = samples_delete[0]
-                dtypes = {k: (getattr(torch, v.replace("torch.", "")) if isinstance(v, str) else v)
-                  for k, v in (s.tensor_dtypes or {}).items()}
-                logger.info("SAMPLE key=%s shapes=%s dtypes=%s", s.mooncake_key, s.tensor_shapes, s.tensor_dtypes)
-                out = mooncake_store.get(s.mooncake_key, s.tensor_shapes, dtypes, torch.device("cpu"))
-                logger.info("ROUNDTRIP hs=%s ids=%s lhs=%s", out.hidden_states.shape, out.input_ids[:8], out.last_hidden_states.shape)
-                verified = True
-            for sample in samples_delete:
-                cleanup_mooncake_data(sample, mooncake_store)
-            queued_batches = 0
 
     final_metric_step = int(completed_steps)
     final_metrics = {}
