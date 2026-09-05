@@ -61,6 +61,7 @@ from torchspec.training.data_fetcher import TrainSample
 from torchspec.utils.logging import logger
 from torchspec.utils.memory import estimate_tensor_bytes
 from torchspec.utils.types import InferenceInput, InferenceOutput
+from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
 
 _estimate_bytes = estimate_tensor_bytes
 
@@ -108,6 +109,13 @@ class SpeedMonitor:
         return self._total_count
 
 
+@dataclass
+class MooncakeEntry:
+    inserted_at: float
+    num_bytes: int
+    has_last_hidden_states: bool
+    has_target: bool
+
 class AsyncTrainingController:
     """Central controller for async training pipeline.
 
@@ -120,7 +128,7 @@ class AsyncTrainingController:
       - Monitors inference and training throughput
     """
 
-    def __init__(self, args, dp_size: int):
+    def __init__(self, args, dp_size: int, mooncake_store: EagleMooncakeStore = None):
         self.args = args
         self.dp_size = dp_size
         self.sp_size = (
@@ -137,6 +145,9 @@ class AsyncTrainingController:
         self._pool_lock = threading.Lock()
         self._pool_bytes = 0
         self._sample_bytes: dict[str, int] = {}
+        self._mooncake_store = mooncake_store
+        self._mooncake_entries: dict[str, MooncakeEntry] = {}
+        self._mooncake_bytes = 0
 
         self.train_queues = [Queue() for _ in range(self.queue_count)]
 
@@ -168,6 +179,14 @@ class AsyncTrainingController:
         self._consecutive_errors: int = 0
         self._last_error_log_time = 0.0
         self._error_lock = threading.Lock()
+        self._eviction_ttl = getattr(args, "sample_eviction_ttl_seconds", 60.0)
+        self._eviction_interval = getattr(args, "sample_eviction_check_interval", 1.0)
+        self._eviction_stop = threading.Event()
+        self._eviction_thread: threading.Thread | None = None
+
+
+    def set_mooncake_store(self, mooncake_store):
+        self._mooncake_store = mooncake_store
 
     def _generate_data_id(self) -> str:
         self._data_id_counter += 1
@@ -445,6 +464,16 @@ class AsyncTrainingController:
         with self._pool_lock:
             return self._pool_bytes
 
+    def get_mooncake_bytes(self) -> int:
+        """Get current bytes in."""
+        with self._pool_lock:
+            return self._mooncake_bytes
+
+    # ─────────────────────────────────────────────────────────────
+    # Dispatch Logic
+    # ─────────────────────────────────────────────────────────────
+
+    
     # ─────────────────────────────────────────────────────────────
     # Dispatch Logic
     # ─────────────────────────────────────────────────────────────
@@ -512,6 +541,15 @@ class AsyncTrainingController:
                 result = self.sample_pool.popleft()
                 sample_bytes = self._sample_bytes.pop(result.mooncake_key, 0)
                 self._pool_bytes -= sample_bytes
+                shapes = result.tensor_shapes or {}
+                mooncake_entry = MooncakeEntry(
+                        inserted_at=time.time(),
+                        num_bytes=sample_bytes,
+                        has_last_hidden_states="last_hidden_states" in shapes,
+                        has_target="target" in shapes,
+                )
+                self._mooncake_entries[result.mooncake_key] = mooncake_entry
+                self._mooncake_bytes += sample_bytes
                 batch_results.append(result)
 
         self._dispatch_to_queues(batch_results, self.train_queues)
@@ -606,6 +644,38 @@ class AsyncTrainingController:
             Current pool bytes after adding the sample.
         """
         return self.push_inference_results([sample])
+
+
+    def _eviction_loop(self):
+        while not self._eviction_stop.wait(self._eviction_interval):
+            now = time.time()
+            with self._pool_lock:
+                expired = [
+                    (k, e) for k, e in self._mooncake_entries.items()
+                    if now - e.inserted_at >= self._eviction_ttl
+                ]
+                for k, _ in expired:
+                    del self._mooncake_entries[k]
+                    self._mooncake_bytes -= _.num_bytes
+            # Do the actual store removal *outside* the lock — it can block on
+            # Mooncake and we don't want to stall push_inference_results.
+            for k, e in expired:
+                try:
+                    self._mooncake_store.remove_eagle3_tensors(
+                        k,
+                        has_last_hidden_states=e.has_last_hidden_states,
+                        has_target=e.has_target,
+                    )
+                except Exception:
+                    logger.exception("Eviction sweep failed for %s", k)
+
+    def start_eviction_sweeper(self):
+        if self._mooncake_store is None:
+            raise RuntimeError("mooncake_store required for time-based eviction")
+        self._eviction_thread = threading.Thread(
+            target=self._eviction_loop, name="controller-evictor", daemon=True,
+        )
+        self._eviction_thread.start()
 
     # ─────────────────────────────────────────────────────────────
     # Eval Pipeline
