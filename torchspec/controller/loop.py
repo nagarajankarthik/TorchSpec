@@ -278,6 +278,7 @@ def training_loop(
         logger.info(f"Resuming from step {start_step} (epoch {current_epoch})")
     progress = tqdm(total=num_steps, desc="Running Inference", unit="step", initial=start_step)
     controller.start_eviction_sweeper()
+    drain_freq = 5
     for step in range(start_step, num_steps):
         is_pipeline_idle = False
         check_deadline = time.monotonic() + 10
@@ -304,6 +305,8 @@ def training_loop(
         completed_steps += 1
         steps_in_current_epoch += 1
         progress.update(1)
+        if completed_steps % drain_freq == 0:
+            controller.drain_queues(controller.train_queues)
 
     final_metric_step = int(completed_steps)
     final_metrics = {}

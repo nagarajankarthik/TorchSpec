@@ -570,8 +570,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
 
         Uses ``batch_remove(force=True)`` to bypass lease TTL and delete
         immediately after consumption. Retries up to 3 times on failure.
-        Never raises — deletion is best-effort to avoid breaking the
-        training fetch path.
+        Raises RuntimeError after 3 failed attempts only if raise_on_failure is set; otherwise deletion is best-effort
 
         Args:
             key: Base key used when storing

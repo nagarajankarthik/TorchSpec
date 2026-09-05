@@ -668,6 +668,8 @@ class AsyncTrainingController:
                 for k, e in expired:
                     del self._mooncake_entries[k]
                     self._mooncake_bytes -= e.num_bytes
+            if expired:
+                logger.info("Evicted %d entries, %.2f GiB resident", len(expired), self._mooncake_bytes / 1024**3)
             # Do the actual store removal *outside* the lock — it can block on
             # Mooncake and we don't want to stall push_inference_results.
             for k, e in expired:
@@ -849,7 +851,7 @@ class AsyncTrainingController:
         self._eviction_stop.set()
         if self._eviction_thread:
             self._eviction_thread.join(timeout=10)
-# Final sweep regardless of age
+        # Final sweep regardless of age
         with self._pool_lock:
             stragglers = list(self._mooncake_entries.items())
             self._mooncake_entries.clear()
@@ -858,7 +860,8 @@ class AsyncTrainingController:
             try:
                 self._mooncake_store.remove_eagle3_tensors(
                     k, has_last_hidden_states=e.has_last_hidden_states,
-                    has_target=e.has_target)
+                    has_target=e.has_target,
+                    raise_on_failure=True)
             except Exception:
                 logger.exception("Final eviction failed for %s", k)
 
