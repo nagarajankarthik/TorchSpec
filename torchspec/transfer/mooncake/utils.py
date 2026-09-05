@@ -319,3 +319,96 @@ def launch_mooncake_master(args):
     atexit.register(_cleanup)
 
     return mooncake_master
+
+
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class MasterCapacity:
+    """Snapshot of Mooncake master memory accounting, in bytes."""
+
+    total_bytes: int
+    allocated_bytes: int
+    evicted_key_count: int
+    evicted_bytes: int
+    put_alloc_failures: int
+
+    @property
+    def available_bytes(self) -> int:
+        return max(0, self.total_bytes - self.allocated_bytes)
+
+    @property
+    def usage_fraction(self) -> float:
+        # Unknown capacity reads as full so callers fail closed.
+        if self.total_bytes <= 0:
+            return 1.0
+        return self.allocated_bytes / self.total_bytes
+
+
+_CAPACITY_METRICS = {
+    "master_total_capacity_bytes": "total_bytes",
+    "master_allocated_bytes": "allocated_bytes",
+    "master_evicted_key_count": "evicted_key_count",
+    "master_evicted_size_bytes": "evicted_bytes",
+    "master_put_start_alloc_failures_total": "put_alloc_failures",
+}
+
+
+def _parse_prometheus_gauges(text: str, wanted: dict[str, str]) -> dict[str, int]:
+    """Extract named scalar metrics from Prometheus text exposition format."""
+    found: dict[str, int] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        name, _, value = line.partition(" ")
+        name = name.split("{", 1)[0]
+        field = wanted.get(name)
+        if field is None or field in found:
+            continue
+        try:
+            found[field] = int(float(value))
+        except ValueError:
+            continue
+    return found
+
+
+def fetch_master_metrics(
+    master_server_address: str,
+    metrics_port: int,
+    timeout: float = 2.0,
+) -> MasterCapacity | None:
+    """Scrape memory accounting from the Mooncake master's HTTP metrics server.
+
+    ``master_total_capacity_bytes`` aggregates every mounted segment, so the
+    result covers the whole cluster regardless of how many clients contribute.
+
+    Returns None if the master is unreachable or the capacity gauges are absent.
+    Callers must treat None as "capacity unknown" and fall back to a
+    conservative limit rather than assuming headroom.
+    """
+    host = master_server_address.rsplit(":", 1)[0]
+    url = f"http://{host}:{metrics_port}/metrics"
+
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        logger.warning("Mooncake metrics scrape failed at %s: %s", url, exc)
+        return None
+
+    values = _parse_prometheus_gauges(body, _CAPACITY_METRICS)
+    if "total_bytes" not in values or "allocated_bytes" not in values:
+        logger.warning("Mooncake metrics at %s missing capacity gauges", url)
+        return None
+
+    return MasterCapacity(
+        total_bytes=values["total_bytes"],
+        allocated_bytes=values["allocated_bytes"],
+        evicted_key_count=values.get("evicted_key_count", 0),
+        evicted_bytes=values.get("evicted_bytes", 0),
+        put_alloc_failures=values.get("put_alloc_failures", 0),
+    )
