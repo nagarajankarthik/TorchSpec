@@ -473,11 +473,6 @@ class AsyncTrainingController:
     # Dispatch Logic
     # ─────────────────────────────────────────────────────────────
 
-    
-    # ─────────────────────────────────────────────────────────────
-    # Dispatch Logic
-    # ─────────────────────────────────────────────────────────────
-
     def set_inference_error(self, msg: str) -> None:
         with self._error_lock:
             self._inference_error = msg
