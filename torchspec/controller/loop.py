@@ -173,8 +173,8 @@ def _safe_training_cleanup(
                 logger.warning(f"Engine shutdown timed out or failed: {exc}")
 
     if mooncake_store is not None and controller is not None:
-        for leftover in controller.drain_pool():
-            cleanup_mooncake_data(leftover, mooncake_store)
+        controller.drain_pool()
+        controller.shutdown()
 
     if mooncake_master is not None:
         try:

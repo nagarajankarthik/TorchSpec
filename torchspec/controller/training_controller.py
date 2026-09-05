@@ -662,11 +662,12 @@ class AsyncTrainingController:
             with self._pool_lock:
                 expired = [
                     (k, e) for k, e in self._mooncake_entries.items()
-                    if now - e.inserted_at >= self._eviction_ttl
+                    if now - e.inserted_at >= self._eviction_ttl and 
+                    k not in self._sample_bytes
                 ]
-                for k, _ in expired:
+                for k, e in expired:
                     del self._mooncake_entries[k]
-                    self._mooncake_bytes -= _.num_bytes
+                    self._mooncake_bytes -= e.num_bytes
             # Do the actual store removal *outside* the lock — it can block on
             # Mooncake and we don't want to stall push_inference_results.
             for k, e in expired:
@@ -675,13 +676,15 @@ class AsyncTrainingController:
                         k,
                         has_last_hidden_states=e.has_last_hidden_states,
                         has_target=e.has_target,
+                        raise_on_failure=True
                     )
                 except Exception:
                     logger.exception("Eviction sweep failed for %s", k)
                     # If deletion fails, restore the entry to the dict so 
                     # that it will be retried on the next eviction sweep.
-                    self._mooncake_entries[k] = e
-                    self._mooncake_bytes += e.num_bytes
+                    with self._pool_lock:
+                        self._mooncake_entries[k] = e
+                        self._mooncake_bytes += e.num_bytes
 
     def start_eviction_sweeper(self):
         if self._mooncake_store is None:

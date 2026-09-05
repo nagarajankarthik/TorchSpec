@@ -564,6 +564,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         key: str,
         has_last_hidden_states: bool = False,
         has_target: bool = False,
+        raise_on_failure: bool = False,
     ) -> None:
         """Force-delete all tensors associated with an Eagle3 output.
 
@@ -576,6 +577,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
             key: Base key used when storing
             has_last_hidden_states: Whether last_hidden_states was stored
             has_target: Whether target (logits) was stored
+            raise_on_failure: Whether to raise a RuntimeError on failure
         """
         keys = [f"{key}_hs", f"{key}_ids"]
         if has_target:
@@ -583,6 +585,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         if has_last_hidden_states:
             keys.append(f"{key}_lhs")
 
+        delete_succeeded = False
         for attempt in range(1, 4):
             try:
                 results = self._store.batch_remove(keys, force=True)
@@ -600,7 +603,8 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
             failed = [(k, r) for k, r in zip(keys, results) if r not in (None, 0, -704)]
             if not failed:
                 logger.debug("Force-deleted %s (%d keys)", key, len(results))
-                return
+                delete_succeeded = True
+                break
             if attempt < 3:
                 time.sleep(0.5)
                 logger.warning(
@@ -611,5 +615,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
                 )
             else:
                 logger.error("Force delete abandoned for %s: %s", key, failed)
-                return
             keys = [k for k, _ in failed]
+
+        if not delete_succeeded and raise_on_failure:
+            raise RuntimeError(f"Force delete failed for {key}")
