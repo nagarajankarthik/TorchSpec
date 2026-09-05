@@ -27,9 +27,18 @@ import socket
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 from torchspec.utils.logging import logger
+
+if TYPE_CHECKING:
+    # Imported lazily elsewhere in this package to avoid a circular dependency
+    # with torchspec.config.mooncake_config.
+    from torchspec.config.mooncake_config import MooncakeConfig
 
 
 def get_free_port():
@@ -321,11 +330,6 @@ def launch_mooncake_master(args):
     return mooncake_master
 
 
-import urllib.error
-import urllib.request
-from dataclasses import dataclass
-
-
 @dataclass(frozen=True)
 class MasterCapacity:
     """Snapshot of Mooncake master memory accounting, in bytes."""
@@ -397,12 +401,14 @@ def fetch_master_metrics(
         with urllib.request.urlopen(url, timeout=timeout) as resp:
             body = resp.read().decode("utf-8", errors="replace")
     except (urllib.error.URLError, OSError, TimeoutError) as exc:
-        logger.warning("Mooncake metrics scrape failed at %s: %s", url, exc)
+        # Callers poll this; returning None is the signal, so keep it quiet and
+        # let them decide how loudly to complain.
+        logger.debug("Mooncake metrics scrape failed at %s: %s", url, exc)
         return None
 
     values = _parse_prometheus_gauges(body, _CAPACITY_METRICS)
     if "total_bytes" not in values or "allocated_bytes" not in values:
-        logger.warning("Mooncake metrics at %s missing capacity gauges", url)
+        logger.debug("Mooncake metrics at %s missing capacity gauges", url)
         return None
 
     return MasterCapacity(
@@ -412,3 +418,80 @@ def fetch_master_metrics(
         evicted_bytes=values.get("evicted_bytes", 0),
         put_alloc_failures=values.get("put_alloc_failures", 0),
     )
+
+
+class MooncakeCapacityMonitor:
+    """Cached view of Mooncake master memory usage.
+
+    The master runs its own eviction at ``eviction_high_watermark_ratio``
+    (default 0.90) and will drop objects consumers have not read yet, so callers
+    should throttle below that. A rising ``evicted_key_count`` means it has
+    already happened.
+    """
+
+    def __init__(
+        self,
+        config: "MooncakeConfig",
+        cache_ttl: float = 0.5,
+        timeout: float = 0.5,
+        unreachable_log_interval: float = 30.0,
+    ):
+        self._config = config
+        self._cache_ttl = cache_ttl
+        # Scrapes are synchronous, and callers poll from an event loop, so the
+        # timeout doubles as the worst-case stall.
+        self._timeout = timeout
+        self._unreachable_log_interval = unreachable_log_interval
+        self._cached: MasterCapacity | None = None
+        self._cached_at = 0.0
+        self._have_cached = False
+        self._last_evicted_key_count = 0
+        self._last_unreachable_log = 0.0
+
+    def snapshot(self) -> MasterCapacity | None:
+        """Latest reading, or None if the master could not be scraped.
+
+        Failures are cached alongside successes so an unreachable master costs
+        one timeout per ``cache_ttl`` rather than one per call.
+        """
+        now = time.monotonic()
+        if self._have_cached and now - self._cached_at < self._cache_ttl:
+            return self._cached
+
+        snapshot = fetch_master_metrics(
+            self._config.master_server_address,
+            self._config.metrics_port,
+            timeout=self._timeout,
+        )
+        self._cached = snapshot
+        self._cached_at = now
+        self._have_cached = True
+
+        if snapshot is None:
+            self._warn_unreachable(now)
+        else:
+            self._warn_on_eviction(snapshot)
+        return snapshot
+
+    def _warn_unreachable(self, now: float) -> None:
+        if now - self._last_unreachable_log < self._unreachable_log_interval:
+            return
+        self._last_unreachable_log = now
+        logger.warning(
+            "Mooncake master metrics unreachable at %s:%s — byte-level "
+            "backpressure is inactive",
+            self._config.master_server_address.rsplit(":", 1)[0],
+            self._config.metrics_port,
+        )
+
+    def _warn_on_eviction(self, snapshot: MasterCapacity) -> None:
+        if snapshot.evicted_key_count <= self._last_evicted_key_count:
+            return
+        logger.error(
+            "Mooncake master evicted %d objects (%d cumulative, %.1f GiB) — "
+            "samples may have been dropped before trainers read them",
+            snapshot.evicted_key_count - self._last_evicted_key_count,
+            snapshot.evicted_key_count,
+            snapshot.evicted_bytes / (1024**3),
+        )
+        self._last_evicted_key_count = snapshot.evicted_key_count

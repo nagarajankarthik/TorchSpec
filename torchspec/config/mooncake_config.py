@@ -52,6 +52,7 @@ class MooncakeConfig:
     local_hostname: str = "localhost"
     metadata_server: str = "http://localhost:8090/metadata"
     master_server_address: str = "localhost:50051"
+    metrics_port: int = 9003
     global_segment_size: str | int = 4 * 1024 * 1024 * 1024
     local_buffer_size: str | int = 512 * 1024 * 1024
     protocol: str = "tcp"
@@ -154,6 +155,7 @@ class MooncakeConfig:
         kwargs = {
             "local_hostname": local_hostname,
             "master_server_address": master_server_address or "localhost:50051",
+            "metrics_port": int(getattr(args, "mooncake_metrics_port", 9003)),
             "global_segment_size": getattr(args, "mooncake_global_segment_size", "4GB"),
             "local_buffer_size": getattr(args, "mooncake_local_buffer_size", "512MB"),
             "host_buffer_size": getattr(args, "mooncake_host_buffer_size", None),
@@ -193,6 +195,7 @@ class MooncakeConfig:
         os.environ["MOONCAKE_LOCAL_HOSTNAME"] = self.local_hostname
         os.environ["MOONCAKE_METADATA_SERVER"] = self.metadata_server
         os.environ["MOONCAKE_MASTER_SERVER"] = self.master_server_address
+        os.environ["MOONCAKE_METRICS_PORT"] = str(self.metrics_port)
         os.environ["MOONCAKE_GLOBAL_SEGMENT_SIZE"] = str(self.global_segment_size)
         os.environ["MOONCAKE_LOCAL_BUFFER_SIZE"] = str(self.local_buffer_size)
         os.environ["MOONCAKE_HOST_BUFFER_SIZE"] = str(self.host_buffer_size)
@@ -259,6 +262,7 @@ class MooncakeConfig:
             master_server_address=os.getenv(
                 "MOONCAKE_MASTER_SERVER", f"{master_host}:{master_port}"
             ),
+            metrics_port=int(cls._env_port("MOONCAKE_METRICS_PORT", "9003")),
             global_segment_size=int(
                 os.getenv("MOONCAKE_GLOBAL_SEGMENT_SIZE", str(4 * 1024 * 1024 * 1024))
             ),

@@ -49,6 +49,7 @@ import torch
 from torchspec.utils.logging import logger
 from torchspec.utils.types import InferenceInput, InferenceOutput
 from torchspec.config.mooncake_config import MooncakeConfig
+from torchspec.transfer.mooncake.utils import MooncakeCapacityMonitor
 
 MOONCAKE_BACKPRESSURE_POLL_INTERVAL = 0.5  # seconds
 MOONCAKE_BACKPRESSURE_LOG_INTERVAL = 5.0  # seconds
@@ -389,6 +390,11 @@ class AsyncInferenceManager:
             logger.warning("Flow control disabled: max_pool_size=0 (unlimited generation)")
 
         self._mooncake_config = mooncake_config
+        self._capacity = MooncakeCapacityMonitor(mooncake_config)
+        # Stay clear of the master's own eviction watermark (default 0.90), which
+        # would silently drop samples trainers have not read yet.
+        self._watermark = getattr(args, "mooncake_watermark_fraction", 0.75)
+        logger.info(f"Mooncake flow control: watermark={self._watermark:.0%} of master capacity")
         self._shape_checked = False
 
     # -- Public API ----------------------------------------------------------
@@ -539,16 +545,13 @@ class AsyncInferenceManager:
         if len(self._prompt_buffer) >= self._buffer_low_watermark:
             return
 
-        if self._max_pool_size > 0:
-            pool_size = self.controller.get_pool_size()
-            if pool_size >= self._max_pool_size:
-                now = time.monotonic()
-                if now - self._last_pool_full_log_time >= 2.0:
-                    self._last_pool_full_log_time = now
-                    logger.debug(
-                        f"Skipping prompt fetch: pool full ({pool_size}/{self._max_pool_size})"
-                    )
-                return
+        reason = self._capacity_block_reason()
+        if reason is not None:
+            now = time.monotonic()
+            if now - self._last_pool_full_log_time >= 2.0:
+                self._last_pool_full_log_time = now
+                logger.debug(f"Skipping prompt fetch: {reason}")
+            return
 
         need = self._buffer_low_watermark - len(self._prompt_buffer)
         fetch_size = max(need, self._refill_size)
@@ -567,32 +570,53 @@ class AsyncInferenceManager:
 
     # -- Backpressure --------------------------------------------------------
 
-    async def _await_pool_capacity(self) -> None:
-        """Block until sample pool has capacity."""
-        if self._max_pool_size <= 0:
-            return
+    def _capacity_block_reason(self) -> str | None:
+        """Why generation must pause, or None if there is room.
 
-        pool_size = self.controller.get_pool_size()
-        if pool_size < self._max_pool_size:
+        Two independent ceilings: the undispatched sample count, and Mooncake
+        residency. The count cap is what keeps this honest whenever the byte
+        gate cannot answer -- unreachable master, no segment mounted yet -- so
+        ``max_sample_pool_size`` must stay configured.
+        """
+        if self._max_pool_size > 0:
+            pool_size = self.controller.get_pool_size()
+            if pool_size >= self._max_pool_size:
+                return f"sample pool full ({pool_size}/{self._max_pool_size})"
+
+        snapshot = self._capacity.snapshot()
+        # total_bytes is 0 until a client mounts its segment. Blocking on that
+        # would deadlock at startup, since the segment is only mounted once
+        # inference actually runs.
+        if snapshot is None or snapshot.total_bytes <= 0:
+            return None
+
+        if snapshot.usage_fraction >= self._watermark:
+            return (
+                f"Mooncake at {snapshot.usage_fraction:.0%} of "
+                f"{snapshot.total_bytes / 1024**3:.1f} GiB "
+                f"(watermark {self._watermark:.0%})"
+            )
+        return None
+
+    async def _await_pool_capacity(self) -> None:
+        """Block until the sample pool and the Mooncake store both have room."""
+        reason = self._capacity_block_reason()
+        if reason is None:
             return
 
         wait_start = time.time()
         last_log_time = wait_start
 
-        logger.warning(
-            f"Sample pool full, pausing generation: pool_size={pool_size}/{self._max_pool_size}"
-        )
+        logger.warning(f"Pausing generation: {reason}")
 
-        while pool_size >= self._max_pool_size and self._running:
+        while reason is not None and self._running:
             await asyncio.sleep(MOONCAKE_BACKPRESSURE_POLL_INTERVAL)
-            pool_size = self.controller.get_pool_size()
+            reason = self._capacity_block_reason()
 
             now = time.time()
-            if now - last_log_time >= MOONCAKE_BACKPRESSURE_LOG_INTERVAL:
-                wait_duration = now - wait_start
+            if reason is not None and now - last_log_time >= MOONCAKE_BACKPRESSURE_LOG_INTERVAL:
                 logger.info(
-                    f"Still waiting for pool capacity (waited {wait_duration:.1f}s): "
-                    f"pool_size={pool_size}/{self._max_pool_size}"
+                    f"Still waiting for capacity (waited {now - wait_start:.1f}s): {reason}"
                 )
                 last_log_time = now
 
@@ -600,10 +624,7 @@ class AsyncInferenceManager:
         if not self._running:
             logger.info(f"Pool wait aborted (shutdown requested) after {wait_duration:.1f}s")
             return
-        logger.info(
-            f"Pool capacity available after {wait_duration:.1f}s, "
-            f"pool_size={pool_size}/{self._max_pool_size}"
-        )
+        logger.info(f"Capacity available after {wait_duration:.1f}s")
 
     # -- Engine dispatch -----------------------------------------------------
 

@@ -81,6 +81,11 @@ mooncake:
   master_port: 8011
   metadata_server: null
   metadata_port: 8012
+  # Must match --metrics_port in launch.sh; the controller scrapes it for backpressure.
+  metrics_port: 8013
+  # Pause generation at this fraction of master capacity. Must stay below the
+  # master's own eviction_high_watermark_ratio (0.90), which drops unread objects.
+  watermark_fraction: 0.75
 
 output_dir: ./outputs/nemotron_3_120b_test
 cache_dir: ./cache/nemotron_3_120b_test
