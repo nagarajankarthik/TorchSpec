@@ -78,6 +78,25 @@ until timeout 1 bash -c '</dev/tcp/localhost/8011' && timeout 1 bash -c '</dev/t
     sleep 1
 done
 
+# Launch Redis server
+redis-server --port 6390 --bind 0.0.0.0 --protected-mode no \
+             --save '' --appendonly no \
+             --maxmemory 2gb --maxmemory-policy noeviction &
+REDIS_PID=$!
+trap "kill -TERM $MC_PID $REDIS_PID 2>/dev/null || true" EXIT
+until timeout 1 bash -c "</dev/tcp/localhost/6390"; do
+    kill -0 $REDIS_PID 2>/dev/null || { echo "redis-server died" >&2; exit 1; }
+    sleep 1
+done
+
+cat >> "${MOONCAKE_ENV_FILE}" <<EOF
+export REDIS_HOST=${LOCAL_IP}
+export REDIS_PORT=6390
+export REDIS_TRAIN_STREAM=train_samples
+export REDIS_EVAL_STREAM=eval_samples
+EOF
+
+
 # 1. Launch vLLM in the background
 # The following comment block in torchspec/inference/engine/vllm_engine should be noted:
 # Layer IDs use post-layer semantics: "capture the residual stream
@@ -108,7 +127,7 @@ ${BASE_DIR}/uv_biome/torchspec/bin/python3 -m vllm.entrypoints.openai.api_server
 
 VLLM_PID=$!
 
-trap "kill -TERM $MC_PID $VLLM_PID 2>/dev/null || true" EXIT
+trap "kill -TERM $MC_PID $REDIS_PID $VLLM_PID 2>/dev/null || true" EXIT
 
 # 2. Wait until the vLLM endpoint is live and healthy
 echo "Waiting for vLLM server to start..."

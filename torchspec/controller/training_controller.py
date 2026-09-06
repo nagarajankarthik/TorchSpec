@@ -30,6 +30,8 @@ Controller manages the tokenized dataset (for epoch reloads and vocab mapping),
 prompt metadata, and mooncake keys. Actual inference tensor data is stored in
 mooncake; the controller only tracks keys and byte sizes for backpressure.
 
+TODO: This part of the docstring needs to be rewritten. dp_size and sp_size are no longer 
+relevant here.
 Batch Size Design:
   micro_batch_size                   # Samples per GPU per dispatch (user config)
   per_dp_rank_batch_size             # = micro_batch_size * sp_size (derived)
@@ -54,6 +56,10 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 import torch
+import json
+from typing import Any, Dict, Optional, Tuple
+import redis
+import os
 
 from queue import Queue
 
@@ -118,6 +124,99 @@ class MooncakeEntry:
     has_last_hidden_states: bool
     has_target: bool
 
+@dataclass
+class TrainSampleRedis:
+    """Redis fields for TrainSample. The consumer is expected to mainly read the first six fields."""
+    mooncake_key: str
+    tensor_shapes: Dict[str, Tuple[int, ...]]
+    tensor_dtypes: Optional[Dict[str, torch.dtype]] = None
+    packed_loss_mask: Optional[str] = None
+    expires_at: float = None
+    producer_idx: int = None
+    last_turn_loss_only: Optional[bool] = None
+    metadata: Optional[Dict[str, Any]] = None
+    data_id: Optional[str] = None
+
+    def to_redis_fields(self) -> dict[str, str]:
+        fields = {
+            "mooncake_key": self.mooncake_key,
+            "tensor_shapes": json.dumps(self.tensor_shapes),
+        }
+
+        if self.tensor_dtypes is not None:
+            fields["tensor_dtypes"] = json.dumps({
+                name: str(dtype).removeprefix("torch.")
+                for name, dtype in self.tensor_dtypes.items()
+            })
+
+        if self.packed_loss_mask is not None:
+            fields["packed_loss_mask"] = self.packed_loss_mask
+
+        if self.expires_at is not None:
+            fields["expires_at"] = str(self.expires_at)
+        else:
+            raise ValueError("expires_at is required but not set for mooncake_key: " + self.mooncake_key)
+
+        if self.producer_idx is not None:
+            fields["producer_idx"] = str(self.producer_idx)
+
+        if self.last_turn_loss_only is not None:
+            fields["last_turn_loss_only"] = (
+                "1" if self.last_turn_loss_only else "0"
+            )
+
+        # Consumers should not rely on this field
+        # It's an artifact of the previous implementation
+        if self.metadata is not None:
+            fields["metadata"] = json.dumps(self.metadata)
+
+        if self.data_id is not None:
+            fields["data_id"] = self.data_id
+
+        return fields
+
+    @classmethod
+    def from_redis_fields(cls, fields: dict) -> "TrainSampleRedis":
+        """
+        This code will only be called by the consumer.
+        """
+        tensor_shapes = {
+            name: tuple(shape)
+            for name, shape in json.loads(
+                fields["tensor_shapes"]
+            ).items()
+        }
+
+        tensor_dtypes = None
+        if "tensor_dtypes" in fields:
+            tensor_dtypes = {
+                name: getattr(torch, dtype_name)
+                for name, dtype_name in json.loads(
+                    fields["tensor_dtypes"]
+                ).items()
+            }
+
+        metadata = None
+        if "metadata" in fields:
+            metadata = json.loads(fields["metadata"])
+
+        last_turn_loss_only = None
+        if "last_turn_loss_only" in fields:
+            last_turn_loss_only = fields["last_turn_loss_only"] == "1"
+
+        return cls(
+            mooncake_key=fields["mooncake_key"],
+            tensor_shapes=tensor_shapes,
+            tensor_dtypes=tensor_dtypes,
+            packed_loss_mask=fields.get("packed_loss_mask"),
+            expires_at=float(fields.get("expires_at", 0.0)),
+            producer_idx=int(fields.get("producer_idx", 0)),
+            last_turn_loss_only=last_turn_loss_only,
+            metadata=metadata,
+            data_id=fields.get("data_id"),
+        )
+
+
 class AsyncTrainingController:
     """Central controller for async training pipeline.
 
@@ -130,15 +229,8 @@ class AsyncTrainingController:
       - Monitors inference and training throughput
     """
 
-    def __init__(self, args, dp_size: int, mooncake_store: EagleMooncakeStore = None):
+    def __init__(self, args, mooncake_store: EagleMooncakeStore = None):
         self.args = args
-        self.dp_size = dp_size
-        self.sp_size = (
-            getattr(args, "sp_ulysses_size", 1) * getattr(args, "sp_ring_size", 1)
-            if getattr(args, "attention_backend", None) == "usp"
-            else 1
-        )
-        self.queue_count = dp_size * self.sp_size
 
         self.prompt_buffer: deque[InferenceInput] = deque()
         self._prompt_lock = threading.Lock()
@@ -150,20 +242,34 @@ class AsyncTrainingController:
         self._mooncake_store = mooncake_store
         self._mooncake_entries: dict[str, MooncakeEntry] = {}
         self._mooncake_bytes = 0
-
-        self.train_queues = [Queue() for _ in range(self.queue_count)]
+        redis_host = os.environ["REDIS_HOST"]
+        redis_port = os.environ["REDIS_PORT"]
+        self.redis_train_stream = getattr(args, "redis_train_stream", "train_samples")
+        self.redis_eval_stream = getattr(args, "redis_eval_stream", "eval_samples")
+        self._redis_client = redis.Redis(
+                host=redis_host, 
+                port=redis_port, 
+                decode_responses=True,
+                socket_timeout=5.0,
+                socket_connect_timeout=5.0)
+        self._publish_max_attempts = getattr(args, "redis_publish_max_attempts", 5)
+        self._publish_retry_seconds = getattr(args, "redis_publish_retry_seconds", 10)
+        self._stream_maxlen = getattr(args, "redis_stream_maxlen", 16384)
+        self._producer_idx = 0
+        self._publish_dropped = 0
+        self._publish_failures = 0
 
         # Eval: separate pool and queues so eval data never mixes with training
+        # Eval is currently unused and requires additional code modifications to work correctly.
         self.eval_pool: deque[InferenceOutput] = deque()
         self._eval_pool_lock = threading.Lock()
         self._eval_data_ids: set[str] = set()
         self._eval_expected_count: int = 0
         self._eval_dispatched_samples: int = 0
-        self.eval_queues = [Queue() for _ in range(self.queue_count)]
 
         self.batch_id = 0
-        self.dispatch_batch_size = args.per_dp_rank_batch_size * dp_size
-        self.eval_dispatch_batch_size = dp_size
+        self.dispatch_batch_size = getattr(args, "redis_dispatch_batch_size", 1)
+        self.eval_dispatch_batch_size = None
         self._data_id_counter = 0
 
         self._stored_dataset: list | None = None
@@ -334,14 +440,13 @@ class AsyncTrainingController:
 
     def load_eval_dataset(self, args) -> int:
         """Load eval dataset on the controller and store it. Returns size (0 if none)."""
+        raise NotImplementedError("Current version of the controller does not support eval dataset")
         raw_dataset = self._load_dataset_split(args, "eval")
         raw_count = len(raw_dataset)
-        # Truncate to a multiple of dp_size so every dispatch is a full batch
-        usable = (raw_count // self.dp_size) * self.dp_size
+        usable = raw_count
         if usable < raw_count:
             logger.info(
                 f"Eval dataset truncated from {raw_count} to {usable} samples "
-                f"(dp_size={self.dp_size})"
             )
         self._stored_eval_dataset = raw_dataset[:usable]
         count = len(self._stored_eval_dataset)
@@ -465,10 +570,6 @@ class AsyncTrainingController:
     # Interface for Training
     # ─────────────────────────────────────────────────────────────
 
-    def get_train_queues(self) -> list[Queue]:
-        """Get the per-DP training queues."""
-        return self.train_queues
-
     def get_pool_size(self) -> int:
         """Total mooncake-resident samples (training + eval) for backpressure.
 
@@ -505,7 +606,7 @@ class AsyncTrainingController:
             self._consecutive_errors = 0
 
     def try_dispatch_batch(self) -> bool:
-        """Try to dispatch one batch to training queues.
+        """Try to dispatch one batch to Redis.
 
         Only dispatches when sample pool has enough samples (>= dispatch_batch_size).
         Dispatches TrainSample objects that MooncakeDataFetcher can consume.
@@ -533,6 +634,8 @@ class AsyncTrainingController:
                         f"Inference manager failed ({self._consecutive_errors}/10): "
                         f"{self._inference_error}"
                     )
+            if self._publish_failures >= 10:
+                raise RuntimeError(f"Redis publish failed {self._publish_failures} times consecutively")
 
         with self._pool_lock:
             pool_size = len(self.sample_pool)
@@ -562,84 +665,87 @@ class AsyncTrainingController:
                     entry.dispatched_at = time.time()      # TTL runs from dispatch, not arrival
                 batch_results.append(result)
 
-        self._dispatch_to_queues(batch_results, self.train_queues)
+        number_dispatched = self._dispatch_to_redis(batch_results, self.redis_train_stream)
 
-        self._training_monitor.record(self.dispatch_batch_size)
+        self._training_monitor.record(number_dispatched)
         logger.debug(
-            f"Dispatched batch {self.batch_id} with {self.dispatch_batch_size} samples "
-            f"to {self.dp_size} queues at t={time.time():.3f}"
+            f"Attempted to dispatch batch {self.batch_id} with {self.dispatch_batch_size} samples "
+            f"to Redis stream at t={time.time():.3f} "
+            f"Actual number dispatched: {number_dispatched} "
         )
         self.batch_id += 1
         return True
 
-    @staticmethod
-    def _seq_len(result: InferenceOutput) -> int:
-        shapes = result.tensor_shapes or {}
-        ids_shape = shapes.get("input_ids")
-        return ids_shape[-1] if ids_shape else 0
+    def _dispatch_to_redis(self, batch_results: list[InferenceOutput], stream_name: str) -> int:
+        """Publish to the Redis stream; returns the number actually published.
 
-    def _partition_results(self, results: list[InferenceOutput]) -> list[list[InferenceOutput]]:
-        """Partition InferenceOutputs across DP ranks.
-
-        When each rank receives more than one sample per dispatch, uses
-        longest-first greedy bin-packing with a per-rank capacity cap so
-        that ranks see similar total sequence load. Falls back to
-        round-robin when there is at most one sample per rank (e.g. eval
-        dispatch, or training with per_dp_rank_batch_size=1) or when
-        len(results) is not divisible by dp_size — preserving the old
-        round-robin behavior for irregular batch sizes.
+        try_dispatch_batch has already popped these from sample_pool and started
+        their eviction clock, so a failure here loses them for good. Retry inside
+        the TTL rather than rolling back, and count failures rather than raising —
+        raising propagates into training_loop and kills the run on a blip.
         """
-        partitions: list[list[InferenceOutput]] = [[] for _ in range(self.dp_size)]
-        if self.dp_size <= 1 or len(results) <= self.dp_size or len(results) % self.dp_size != 0:
-            for i, result in enumerate(results):
-                partitions[i % self.dp_size].append(result)
-            return partitions
+        samples = []
+        for result in batch_results:
+            entry = self._mooncake_entries.get(result.mooncake_key)
+            if entry is None or entry.dispatched_at is None:
+                # No retention guarantee we can state. Publishing anyway would send
+                # expires_at absent -> consumer reads 0.0 -> treats it as expired.
+                logger.error("No mooncake entry for %s; not publishing", result.mooncake_key)
+                self._publish_dropped += 1
+                continue
+            metadata = getattr(result, "metadata", {}) or {}
+            samples.append(TrainSampleRedis(
+                mooncake_key=result.mooncake_key,
+                tensor_shapes=result.tensor_shapes,
+                tensor_dtypes=result.tensor_dtypes,
+                packed_loss_mask=result.packed_loss_mask,
+                expires_at=entry.dispatched_at + self._eviction_ttl,
+                producer_idx=self._producer_idx,
+                last_turn_loss_only=metadata.get("has_thinking"),
+                metadata=metadata,
+                data_id=result.data_id,
+            ))
+            self._producer_idx += 1
 
-        capacity = len(results) // self.dp_size
-        loads = [0] * self.dp_size
-        for result in sorted(results, key=self._seq_len, reverse=True):
-            min_rank = min(
-                (r for r in range(self.dp_size) if len(partitions[r]) < capacity),
-                key=lambda r: loads[r],
+        pending = samples
+        for attempt in range(1, self._publish_max_attempts + 1):
+            pending = self._xadd_batch(pending, stream_name)
+            if not pending:
+                break
+            if attempt < self._publish_max_attempts:
+                time.sleep(self._publish_retry_seconds)
+
+        if pending:
+            self._publish_dropped += len(pending)
+            self._publish_failures += 1
+            logger.error("Dropped %d samples after %d publish attempts (%d consecutive)",
+                         len(pending), self._publish_max_attempts, self._publish_failures)
+        elif samples:
+            self._publish_failures = 0
+
+        return len(samples) - len(pending)
+
+
+    def _xadd_batch(self, samples: list[TrainSampleRedis], stream_name: str) -> list[TrainSampleRedis]:
+        """One pipelined round trip. Returns only the samples that failed."""
+        if not samples:
+            return []
+        pipe = self._redis_client.pipeline(transaction=False)
+        for s in samples:
+            pipe.xadd(
+                name=stream_name,
+                fields=s.to_redis_fields(),
+                id="*",                       # Redis assigns <ms>-<seq>
+                maxlen=self._stream_maxlen,
+                approximate=True,             # MAXLEN ~ N: trims whole nodes, O(1)
             )
-            partitions[min_rank].append(result)
-            loads[min_rank] += self._seq_len(result)
-        return partitions
+        try:
+            results = pipe.execute(raise_on_error=False)
+        except redis.RedisError as exc:
+            logger.warning("Redis pipeline failed entirely: %s", exc)
+            return samples
+        return [s for s, r in zip(samples, results) if isinstance(r, Exception)]
 
-    def _dispatch_to_queues(
-        self,
-        batch_results: list[InferenceOutput],
-        queues: list[Queue],
-    ) -> None:
-        """Partition results across DP ranks and push TrainSamples into queues."""
-        partitioned = self._partition_results(batch_results)
-        for dp_rank, results in enumerate(partitioned):
-            for result in results:
-                metadata = getattr(result, "metadata", {}) or {}
-                last_turn_loss_only = metadata.get("has_thinking")
-                sample = TrainSample(
-                    mooncake_key=result.mooncake_key,
-                    tensor_shapes=result.tensor_shapes,
-                    tensor_dtypes=result.tensor_dtypes,
-                    packed_loss_mask=result.packed_loss_mask,
-                    last_turn_loss_only=last_turn_loss_only,
-                    metadata=metadata,
-                    data_id=result.data_id,
-                )
-                if self.sp_size > 1 and len(queues) == self.queue_count:
-                    start = dp_rank * self.sp_size
-                    for rank in range(start, start + self.sp_size):
-                        queues[rank].put(sample)
-                else:
-                    queues[dp_rank].put(sample)
-
-    def drain_queues(self, queues: list[Queue]) -> list[TrainSample]:
-        sample_list = []
-        for queue in queues:
-            while not queue.empty():
-                sample = queue.get()
-                sample_list.append(sample)
-        return sample_list
 
     def push_inference_sample(self, sample: InferenceOutput) -> int:
         """Add a single inference sample to the training pool.
@@ -702,6 +808,9 @@ class AsyncTrainingController:
                 with self._pool_lock:
                     self._mooncake_entries[k] = e
                     self._mooncake_bytes += e.num_bytes
+        # Remove the corresponding entries from Redis.
+        cutoff_ms = int((time.time() - 2 * self._eviction_ttl) * 1000)
+        self._redis_client.xtrim(self.redis_train_stream, minid=cutoff_ms, approximate=True)
 
     def _eviction_loop(self):
         """Sweep until stopped, surviving any failure in a single sweep.
@@ -794,9 +903,6 @@ class AsyncTrainingController:
         with self._eval_pool_lock:
             return len(self.eval_pool)
 
-    def get_eval_queues(self) -> list[Queue]:
-        return self.eval_queues
-
     def try_dispatch_eval_batch(self) -> bool:
         """Dispatch one eval batch from the pool if enough samples are available."""
         bs = self.eval_dispatch_batch_size
@@ -805,7 +911,7 @@ class AsyncTrainingController:
                 return False
             batch_results = [self.eval_pool.popleft() for _ in range(bs)]
 
-        self._dispatch_to_queues(batch_results, self.eval_queues)
+        self._dispatch_to_redis(batch_results, self.redis_eval_stream)
         self._eval_dispatched_samples += bs
         logger.debug(
             f"Eval: dispatched batch ({self._eval_dispatched_samples}/"
@@ -906,8 +1012,6 @@ class AsyncTrainingController:
                     raise_on_failure=True)
             except Exception:
                 logger.exception("Final eviction failed for %s", k)
+        self._redis_client.xadd(name=self.redis_train_stream, fields={"v": "1", "type": "eos"}, id="*")
 
 
-        for q in self.train_queues:
-            q.put(None)
-        logger.info("Controller shutdown: sent stop signals to training queues")

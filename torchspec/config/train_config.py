@@ -192,6 +192,16 @@ class DecodeConfig:
     weight_sync_enabled: bool = False
     weight_sync_interval: int = 500
 
+@dataclass
+class RedisConfig:
+    dispatch_batch_size: int = 1
+    publish_max_attempts: int = 5
+    publish_retry_seconds: int = 10
+    stream_maxlen: int = 16384
+    train_stream: str = "train_samples"
+    eval_stream: str = "eval_samples"
+
+
 
 @dataclass
 class Config:
@@ -203,6 +213,7 @@ class Config:
     model: ModelConfig = field(default_factory=ModelConfig)
     mooncake: dict[str, Any] = field(default_factory=dict)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    redis: RedisConfig = field(default_factory=RedisConfig)
     cache_dir: str = "./cache"
     cache_key: Optional[str] = None
     model_download_dir: Optional[str] = None
@@ -393,6 +404,7 @@ _PREFIXED_SECTIONS = {
     "vllm": "vllm_",
     "trtllm": "trtllm_",
     "tokenspeed": "tokenspeed_",
+    "redis": "redis_",
 }
 
 

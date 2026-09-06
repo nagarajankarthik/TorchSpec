@@ -89,6 +89,14 @@ mooncake:
   sample_eviction_ttl_seconds: 60
   sample_eviction_check_interval: 1.0
 
+redis:
+  dispatch_batch_size: 2
+  publish_max_attempts: 2
+  publish_retry_seconds: 2
+  stream_maxlen: 16384
+  train_stream: "train_samples"
+  eval_stream: "eval_samples"
+
 output_dir: ./outputs/nemotron_3_120b_test
 cache_dir: ./cache/nemotron_3_120b_test
 model_download_dir: null

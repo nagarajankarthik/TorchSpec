@@ -344,9 +344,9 @@ def train_async_no_generation(args):
     init_tracking(args)
     timer = _InitTimer()
 
-    # [1] Create controller early (lightweight: only needs args + dp_size)
+    # [1] Create controller early (lightweight: only needs args )
     with timer.phase("Create controller"):
-        controller = AsyncTrainingController(args, args.dp_size)
+        controller = AsyncTrainingController(args)
 
     # [2] Kick off dataset loading on controller
     # The original design used Ray to locate the controller in a separate process
