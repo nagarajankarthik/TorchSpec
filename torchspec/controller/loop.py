@@ -25,7 +25,6 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
-import torch
 
 import ray
 import wandb
@@ -268,8 +267,6 @@ def training_loop(
         f"steps_per_epoch={steps_per_epoch}, "
         f"dispatch_batch_size={controller.dispatch_batch_size}"
     )
-
-    prefetch_batches = getattr(args, "prefetch_depth", 1)
 
     completed_steps = start_step
     current_epoch = completed_steps // steps_per_epoch + 1

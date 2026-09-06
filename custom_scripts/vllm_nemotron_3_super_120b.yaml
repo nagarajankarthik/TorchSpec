@@ -90,10 +90,18 @@ mooncake:
   sample_eviction_check_interval: 1.0
 
 redis:
+  # Samples per XADD pipeline round trip. Publish granularity only -- it no
+  # longer has any relationship to the trainers' data-parallel degree.
   dispatch_batch_size: 2
+  # (max_attempts - 1) * retry_seconds = 2s of dispatch-loop blocking worst
+  # case. Keep well under mooncake.sample_eviction_ttl_seconds.
   publish_max_attempts: 2
   publish_retry_seconds: 2
+  # Must exceed watermark * global_segment_size / bytes_per_shortest_sample,
+  # i.e. the most samples Mooncake can hold at once. Checked at startup.
   stream_maxlen: 16384
+  min_expected_seq_len: 128
+  heartbeat_seconds: 10.0
   train_stream: "train_samples"
   eval_stream: "eval_samples"
 

@@ -30,24 +30,13 @@ Controller manages the tokenized dataset (for epoch reloads and vocab mapping),
 prompt metadata, and mooncake keys. Actual inference tensor data is stored in
 mooncake; the controller only tracks keys and byte sizes for backpressure.
 
-TODO: This part of the docstring needs to be rewritten. dp_size and sp_size are no longer 
-relevant here.
 Batch Size Design:
-  micro_batch_size                   # Samples per GPU per dispatch (user config)
-  per_dp_rank_batch_size             # = micro_batch_size * sp_size (derived)
-  dispatch_batch_size            # = per_dp_rank_batch_size * dp_size (samples per dispatch)
-  global_batch_size                  # = dispatch_batch_size * accumulation_steps (per optimizer step)
+  redis.dispatch_batch_size          # Samples published per XADD pipeline round trip
 
-  Example with micro_batch_size=2, sp_size=1, dp_size=4, accumulation_steps=2:
-    - per_dp_rank_batch_size = 2 * 1 = 2
-    - dispatch_batch_size = 2 * 4 = 8
-    - global_batch_size = 8 * 2 = 16
-
-  Data flow per optimizer step (with accumulation_steps=2):
-    1. Controller dispatches 8 samples per dispatch, 2 dispatches per optimizer step
-    2. Each DP rank receives 2 samples per dispatch (4 total per optimizer step)
-    3. Each train actor calls train_from_queue(num_batches=accumulation_steps)
-    4. Forward/backward for each micro-batch, optimizer step after last one
+  This is now purely publish granularity. The DP fan-out that used to derive it
+  (micro_batch_size -> per_dp_rank_batch_size -> dispatch_batch_size) lives on
+  the consumer side: the controller publishes one flat stream and knows nothing
+  about how many trainers read it or at what data-parallel degree.
 """
 
 import copy
@@ -61,10 +50,7 @@ from typing import Any, Dict, Optional, Tuple
 import redis
 import os
 
-from queue import Queue
-
 from torchspec.data.utils import length_grouped_order
-from torchspec.training.data_fetcher import TrainSample
 from torchspec.utils.logging import logger
 from torchspec.utils.memory import estimate_tensor_bytes
 from torchspec.utils.types import InferenceInput, InferenceOutput
@@ -124,21 +110,51 @@ class MooncakeEntry:
     has_last_hidden_states: bool
     has_target: bool
 
+# Wire-format version for the Redis stream. Bump on any breaking change to the
+# field set; consumers must check it before parsing. Every entry carries it.
+STREAM_SCHEMA_VERSION = "1"
+STREAM_TYPE_SAMPLE = "sample"
+STREAM_TYPE_EOS = "eos"
+STREAM_TYPE_HEARTBEAT = "heartbeat"
+
+
+def eos_fields() -> dict[str, str]:
+    """Terminal entry. Consumers stop when they read this."""
+    return {"v": STREAM_SCHEMA_VERSION, "type": STREAM_TYPE_EOS}
+
+
+def heartbeat_fields(producer_idx: int) -> dict[str, str]:
+    """Liveness ping so a consumer can tell "producer slow" from "producer gone"."""
+    return {
+        "v": STREAM_SCHEMA_VERSION,
+        "type": STREAM_TYPE_HEARTBEAT,
+        "sent_at": str(time.time()),
+        "producer_idx": str(producer_idx),
+    }
+
+
 @dataclass
 class TrainSampleRedis:
-    """Redis fields for TrainSample. The consumer is expected to mainly read the first six fields."""
+    """One training sample's metadata, as it crosses the Redis stream.
+
+    Every entry carries ``v`` and ``type``; consumers must branch on ``type``
+    before parsing, since control entries (eos, heartbeat) share the stream and
+    carry none of the sample fields.
+    """
     mooncake_key: str
     tensor_shapes: Dict[str, Tuple[int, ...]]
     tensor_dtypes: Optional[Dict[str, torch.dtype]] = None
     packed_loss_mask: Optional[str] = None
-    expires_at: float = None
-    producer_idx: int = None
+    expires_at: Optional[float] = None
+    producer_idx: Optional[int] = None
     last_turn_loss_only: Optional[bool] = None
     metadata: Optional[Dict[str, Any]] = None
     data_id: Optional[str] = None
 
     def to_redis_fields(self) -> dict[str, str]:
         fields = {
+            "v": STREAM_SCHEMA_VERSION,
+            "type": STREAM_TYPE_SAMPLE,
             "mooncake_key": self.mooncake_key,
             "tensor_shapes": json.dumps(self.tensor_shapes),
         }
@@ -177,9 +193,23 @@ class TrainSampleRedis:
 
     @classmethod
     def from_redis_fields(cls, fields: dict) -> "TrainSampleRedis":
+        """Parse a stream entry. Consumer-side only.
+
+        Raises ValueError on an unknown schema version or a non-sample entry,
+        so a consumer that forgets to branch on ``type`` fails loudly rather
+        than KeyError-ing on a missing ``mooncake_key``.
         """
-        This code will only be called by the consumer.
-        """
+        version = fields.get("v")
+        if version != STREAM_SCHEMA_VERSION:
+            raise ValueError(
+                f"Unsupported stream schema version {version!r} "
+                f"(this consumer understands {STREAM_SCHEMA_VERSION!r})"
+            )
+        entry_type = fields.get("type")
+        if entry_type != STREAM_TYPE_SAMPLE:
+            raise ValueError(
+                f"Not a sample entry (type={entry_type!r}); branch on 'type' before parsing"
+            )
         tensor_shapes = {
             name: tuple(shape)
             for name, shape in json.loads(
@@ -252,12 +282,16 @@ class AsyncTrainingController:
                 decode_responses=True,
                 socket_timeout=5.0,
                 socket_connect_timeout=5.0)
-        self._publish_max_attempts = getattr(args, "redis_publish_max_attempts", 5)
-        self._publish_retry_seconds = getattr(args, "redis_publish_retry_seconds", 10)
+        self._publish_max_attempts = getattr(args, "redis_publish_max_attempts", 2)
+        self._publish_retry_seconds = getattr(args, "redis_publish_retry_seconds", 2)
         self._stream_maxlen = getattr(args, "redis_stream_maxlen", 16384)
+        self._min_expected_seq_len = getattr(args, "redis_min_expected_seq_len", 128)
+        self._heartbeat_seconds = getattr(args, "redis_heartbeat_seconds", 10.0)
+        self._last_heartbeat = 0.0
         self._producer_idx = 0
         self._publish_dropped = 0
         self._publish_failures = 0
+        self._check_stream_maxlen()
 
         # Eval: separate pool and queues so eval data never mixes with training
         # Eval is currently unused and requires additional code modifications to work correctly.
@@ -293,6 +327,52 @@ class AsyncTrainingController:
         self._eviction_thread: threading.Thread | None = None
         self.verified_tensor_shapes = False
 
+
+    def _check_stream_maxlen(self) -> None:
+        """Fail if the stream cannot hold a reference to every resident sample.
+
+        The stream must retain an entry at least as long as Mooncake retains
+        the tensors it points at, or consumers never learn about samples that
+        are still fetchable. Working that through, the TTL cancels out:
+
+            N >= rate * ttl,  rate <= watermark * segment / (ttl * bytes)
+            =>  N >= watermark * segment / bytes_per_sample
+
+        i.e. the stream must be at least as long as the maximum number of
+        samples that can be resident at once. Short samples are cheap, so more
+        of them fit -- which is why this is sized against the *shortest*
+        expected sequence, not the average.
+        """
+        from torchspec.config.mooncake_config import MooncakeConfig
+
+        segment = getattr(self.args, "mooncake_global_segment_size", None)
+        hidden_dim = getattr(self.args, "mooncake_hidden_dim", None)
+        num_aux = getattr(self.args, "mooncake_num_aux_layers", None)
+        watermark = getattr(self.args, "mooncake_watermark_fraction", 0.75)
+        if segment is None or hidden_dim is None or num_aux is None:
+            logger.warning("Cannot check redis.stream_maxlen: mooncake sizing config missing")
+            return
+
+        if isinstance(segment, str):
+            segment = MooncakeConfig.parse_size(segment)
+        # hidden_states + last_hidden_states (bf16) + input_ids (int64), per token
+        bytes_per_token = (num_aux * hidden_dim + hidden_dim) * 2 + 8
+        min_sample_bytes = self._min_expected_seq_len * bytes_per_token
+        required = int(watermark * segment / min_sample_bytes) + 1
+
+        logger.info(
+            "redis.stream_maxlen=%d (>= %d required: watermark=%.2f x segment=%.1fGiB / "
+            "%.1fMiB per %d-token sample)",
+            self._stream_maxlen, required, watermark, segment / 1024**3,
+            min_sample_bytes / 1024**2, self._min_expected_seq_len,
+        )
+        if self._stream_maxlen < required:
+            raise ValueError(
+                f"redis.stream_maxlen={self._stream_maxlen} is below the {required} entries "
+                f"needed to reference every sample Mooncake can hold at once. Raise it, or "
+                f"raise redis.min_expected_seq_len if {self._min_expected_seq_len} tokens is "
+                f"shorter than anything your corpus actually produces."
+            )
 
     def set_mooncake_store(self, mooncake_store):
         self._mooncake_store = mooncake_store
@@ -439,19 +519,12 @@ class AsyncTrainingController:
         return self.add_dataset(self._prepare_dataset())
 
     def load_eval_dataset(self, args) -> int:
-        """Load eval dataset on the controller and store it. Returns size (0 if none)."""
-        raise NotImplementedError("Current version of the controller does not support eval dataset")
-        raw_dataset = self._load_dataset_split(args, "eval")
-        raw_count = len(raw_dataset)
-        usable = raw_count
-        if usable < raw_count:
-            logger.info(
-                f"Eval dataset truncated from {raw_count} to {usable} samples "
-            )
-        self._stored_eval_dataset = raw_dataset[:usable]
-        count = len(self._stored_eval_dataset)
-        logger.info(f"Controller loaded eval dataset: {count} samples")
-        return count
+        """Not supported: the eval path still assumes per-DP-rank queues."""
+        raise NotImplementedError(
+            "Eval is not supported by the Redis-based controller. try_dispatch_eval_batch "
+            "and finalize_eval_dispatch still need a batch size that used to come from "
+            "dp_size, which now lives on the consumer side."
+        )
 
     def get_dataset_size(self) -> int:
         if self._stored_dataset is None:
@@ -808,9 +881,41 @@ class AsyncTrainingController:
                 with self._pool_lock:
                     self._mooncake_entries[k] = e
                     self._mooncake_bytes += e.num_bytes
-        # Remove the corresponding entries from Redis.
+        # Time-align the stream with the store. Guarded separately from the
+        # Mooncake removals above: a Redis fault here would otherwise surface as
+        # "Eviction sweep raised", blaming eviction for a publishing problem.
+        # The 2x keeps the stream strictly outliving the store -- an entry whose
+        # tensors are gone is detectable via expires_at, a trimmed one is not.
         cutoff_ms = int((time.time() - 2 * self._eviction_ttl) * 1000)
-        self._redis_client.xtrim(self.redis_train_stream, minid=cutoff_ms, approximate=True)
+        for stream in (self.redis_train_stream, self.redis_eval_stream):
+            try:
+                self._redis_client.xtrim(stream, minid=cutoff_ms, approximate=True)
+            except Exception:
+                logger.warning("XTRIM failed for stream %s", stream, exc_info=True)
+
+        self._maybe_heartbeat()
+
+    def _maybe_heartbeat(self) -> None:
+        """Emit a liveness entry so consumers can distinguish slow from dead.
+
+        Best-effort: a failed heartbeat must not abort the eviction sweep, and
+        it deliberately does not touch _publish_failures -- losing a ping is
+        not the same as losing data.
+        """
+        now = time.time()
+        if now - self._last_heartbeat < self._heartbeat_seconds:
+            return
+        self._last_heartbeat = now
+        try:
+            self._redis_client.xadd(
+                name=self.redis_train_stream,
+                fields=heartbeat_fields(self._producer_idx),
+                id="*",
+                maxlen=self._stream_maxlen,
+                approximate=True,
+            )
+        except Exception:
+            logger.debug("Heartbeat XADD failed", exc_info=True)
 
     def _eviction_loop(self):
         """Sweep until stopped, surviving any failure in a single sweep.
@@ -905,6 +1010,8 @@ class AsyncTrainingController:
 
     def try_dispatch_eval_batch(self) -> bool:
         """Dispatch one eval batch from the pool if enough samples are available."""
+        if self.eval_dispatch_batch_size is None:
+            raise NotImplementedError("Eval dispatch requires a batch size; see load_eval_dataset")
         bs = self.eval_dispatch_batch_size
         with self._eval_pool_lock:
             if len(self.eval_pool) < bs:
@@ -925,6 +1032,8 @@ class AsyncTrainingController:
         Raises AssertionError if not all expected samples have arrived or
         undispatched full batches remain in the pool.
         """
+        if self.eval_dispatch_batch_size is None:
+            raise NotImplementedError("Eval dispatch requires a batch size; see load_eval_dataset")
         with self._eval_pool_lock:
             arrived = self._eval_dispatched_samples + len(self.eval_pool)
             pool_remaining = len(self.eval_pool)
@@ -960,6 +1069,8 @@ class AsyncTrainingController:
             "prompt_buffer_size": len(self.prompt_buffer),
             "sample_pool_size": len(self.sample_pool),
             "batches_dispatched": self.batch_id,
+            "published": self._producer_idx,
+            "publish_dropped": self._publish_dropped,
             "dispatch_batch_size": self.dispatch_batch_size,
         }
 
@@ -1012,6 +1123,16 @@ class AsyncTrainingController:
                     raise_on_failure=True)
             except Exception:
                 logger.exception("Final eviction failed for %s", k)
-        self._redis_client.xadd(name=self.redis_train_stream, fields={"v": "1", "type": "eos"}, id="*")
+        try:
+            self._redis_client.xadd(name=self.redis_train_stream, fields=eos_fields(), id="*")
+        except Exception:
+            logger.warning("Failed to publish EOS; consumers will rely on the heartbeat "
+                           "going stale", exc_info=True)
+        # item 3: NOACK makes loss silent by design, so this counter is the only
+        # record that it happened. A sweep whose arms differ here is confounded.
+        logger.info(
+            "Controller shutdown: published=%d dropped=%d (stream=%s)",
+            self._producer_idx, self._publish_dropped, self.redis_train_stream,
+        )
 
 

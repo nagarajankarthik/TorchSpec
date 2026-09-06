@@ -89,11 +89,14 @@ until timeout 1 bash -c "</dev/tcp/localhost/6390"; do
     sleep 1
 done
 
+# Host and port are deployment facts, so they are set here. The stream names
+# are NOT: mooncake_helper already wrote them into this file from the config,
+# which is what the controller reads. Duplicating them here would let the two
+# drift, and the producer would publish to one stream while consumers blocked
+# on another -- no error, no data.
 cat >> "${MOONCAKE_ENV_FILE}" <<EOF
 export REDIS_HOST=${LOCAL_IP}
 export REDIS_PORT=6390
-export REDIS_TRAIN_STREAM=train_samples
-export REDIS_EVAL_STREAM=eval_samples
 EOF
 
 
@@ -131,8 +134,7 @@ trap "kill -TERM $MC_PID $REDIS_PID $VLLM_PID 2>/dev/null || true" EXIT
 
 # 2. Wait until the vLLM endpoint is live and healthy
 echo "Waiting for vLLM server to start..."
-export VLLM_STARTUP_TIMEOUT=7200
-VLLM_STARTUP_TIMEOUT="${VLLM_STARTUP_TIMEOUT:-3600}"
+VLLM_STARTUP_TIMEOUT="${VLLM_STARTUP_TIMEOUT:-7200}"
 VLLM_DEADLINE=$(( SECONDS + VLLM_STARTUP_TIMEOUT ))
 until curl -s http://localhost:8080/health > /dev/null; do
     if ! kill -0 $VLLM_PID 2>/dev/null; then

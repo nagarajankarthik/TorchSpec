@@ -194,10 +194,22 @@ class DecodeConfig:
 
 @dataclass
 class RedisConfig:
+    """Producer-side stream settings.
+
+    ``publish_*`` bound how long a failed XADD blocks the dispatch loop:
+    ``(max_attempts - 1) * retry_seconds``. Keep that small relative to
+    ``mooncake.sample_eviction_ttl_seconds``, or a sample that lands on the
+    last attempt reaches consumers with most of its retention already spent.
+    """
+
     dispatch_batch_size: int = 1
-    publish_max_attempts: int = 5
-    publish_retry_seconds: int = 10
+    publish_max_attempts: int = 2
+    publish_retry_seconds: int = 2
     stream_maxlen: int = 16384
+    # Shortest sequence the corpus can produce; used to check stream_maxlen
+    # against the maximum number of samples Mooncake can hold at once.
+    min_expected_seq_len: int = 128
+    heartbeat_seconds: float = 10.0
     train_stream: str = "train_samples"
     eval_stream: str = "eval_samples"
 
