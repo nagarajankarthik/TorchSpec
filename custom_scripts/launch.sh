@@ -118,6 +118,7 @@ source ${MOONCAKE_ENV_FILE}
 ${BASE_DIR}/uv_biome/torchspec/bin/python3 -m vllm.entrypoints.openai.api_server \
     --model nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16 \
     --max-model-len 16384 \
+    --load-format instanttensor \
     --gpu-memory-utilization 0.85 \
     --port 8080 \
     --tensor-parallel-size 4 \
