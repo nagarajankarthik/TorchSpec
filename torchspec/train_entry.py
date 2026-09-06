@@ -374,6 +374,14 @@ def train_async_no_generation(args):
 
 
     controller.set_mooncake_store(mooncake_store)
+
+    # [4b] Publish the run plan before any sample can appear on the stream.
+    # A trainer that joins mid-run reads this to size its LR schedule;
+    # dataset_size is not in the config, since it is whatever survives loading
+    # and filtering. Must precede the inference manager, which publishes.
+    with timer.phase("Publish run meta"):
+        controller.publish_run_meta(dataset_size)
+
     # [5] Auto-calculate training steps (needs dataset_size)
     with timer.phase("Auto-calculate training steps"):
         auto_calculate_training_steps(args, dataset_size)

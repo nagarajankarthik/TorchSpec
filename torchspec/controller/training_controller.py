@@ -123,13 +123,24 @@ def eos_fields() -> dict[str, str]:
     return {"v": STREAM_SCHEMA_VERSION, "type": STREAM_TYPE_EOS}
 
 
-def heartbeat_fields(producer_idx: int) -> dict[str, str]:
-    """Liveness ping so a consumer can tell "producer slow" from "producer gone"."""
+# Run-metadata hash field values.
+RUN_STATUS_RUNNING = "running"
+RUN_STATUS_FINISHED = "finished"
+
+
+def heartbeat_fields(producer_idx: int, epoch: int) -> dict[str, str]:
+    """Liveness ping so a consumer can tell "producer slow" from "producer gone".
+
+    ``epoch`` is the producer's *current* pass over the dataset, not a label for
+    any particular sample -- a sample published now may have been queued during
+    the previous pass. Treat it as a coarse progress signal.
+    """
     return {
         "v": STREAM_SCHEMA_VERSION,
         "type": STREAM_TYPE_HEARTBEAT,
         "sent_at": str(time.time()),
         "producer_idx": str(producer_idx),
+        "epoch": str(epoch),
     }
 
 
@@ -285,6 +296,10 @@ class AsyncTrainingController:
         self._publish_max_attempts = getattr(args, "redis_publish_max_attempts", 2)
         self._publish_retry_seconds = getattr(args, "redis_publish_retry_seconds", 2)
         self._stream_maxlen = getattr(args, "redis_stream_maxlen", 16384)
+        self._meta_key = (
+            f"{self.redis_train_stream}:"
+            f"{getattr(args, 'redis_meta_key_suffix', 'meta')}"
+        )
         self._min_expected_seq_len = getattr(args, "redis_min_expected_seq_len", 128)
         self._heartbeat_seconds = getattr(args, "redis_heartbeat_seconds", 10.0)
         self._last_heartbeat = 0.0
@@ -373,6 +388,72 @@ class AsyncTrainingController:
                 f"raise redis.min_expected_seq_len if {self._min_expected_seq_len} tokens is "
                 f"shorter than anything your corpus actually produces."
             )
+
+    def publish_run_meta(self, dataset_size: int) -> dict[str, str]:
+        """Publish the run plan to ``{stream}:meta`` for consumers to read.
+
+        A trainer that joins midway cannot infer any of this from the stream.
+        ``dataset_size`` in particular is not in the config -- it is whatever
+        survives loading and filtering, so only the producer knows it, and only
+        at runtime.
+
+        Must be called BEFORE the first XADD, or a fast consumer could read a
+        sample and find no plan. Raises on failure: without this a consumer
+        cannot size its LR schedule, so failing at startup beats failing subtly
+        an hour in.
+
+        A late joiner cannot see samples published before it arrived, so it
+        cannot do "N epochs" in the strict sense. What it can do is size its
+        schedule from what remains::
+
+            remaining = total_samples_planned - producer_idx_at_join
+            steps     = remaining / its own global_batch_size
+
+        That biases high, since drops reduce the real count -- the safe
+        direction, because EOS stops the run regardless.
+        """
+        num_epochs = getattr(self.args, "num_epochs", 1)
+        meta = {
+            "v": STREAM_SCHEMA_VERSION,
+            # Guards against a consumer reading a previous run's plan if this
+            # ever points at a Redis that outlives the job.
+            "run_id": str(os.environ.get("JOB_ID", "unknown")),
+            "status": RUN_STATUS_RUNNING,
+            "started_at": str(time.time()),
+            "stream": self.redis_train_stream,
+            # --- the run plan ---
+            "dataset_size": str(dataset_size),
+            "num_epochs": str(num_epochs),
+            "total_samples_planned": str(dataset_size * num_epochs),
+            # --- the retention contract ---
+            "eviction_ttl_seconds": str(self._eviction_ttl),
+            # --- shapes, so a consumer can assert its draft config matches
+            # before building the model rather than hitting a reshape error
+            # deep in the Mooncake fetch path ---
+            "hidden_dim": str(getattr(self.args, "mooncake_hidden_dim", "")),
+            "num_aux_layers": str(getattr(self.args, "mooncake_num_aux_layers", "")),
+            "max_seq_len": str(getattr(self.args, "mooncake_max_seq_len", "")),
+        }
+        self._redis_client.hset(self._meta_key, mapping=meta)
+        logger.info(
+            "Published run meta to %s: dataset_size=%s num_epochs=%s "
+            "total_samples_planned=%s ttl=%ss",
+            self._meta_key, dataset_size, num_epochs,
+            meta["total_samples_planned"], self._eviction_ttl,
+        )
+        return meta
+
+    def _set_run_status(self, status: str) -> None:
+        """Mark the run finished. Best-effort: EOS is the primary signal."""
+        try:
+            self._redis_client.hset(self._meta_key, mapping={
+                "status": status, "ended_at": str(time.time()),
+                "published": str(self._producer_idx),
+                "dropped": str(self._publish_dropped),
+            })
+        except Exception:
+            logger.warning("Failed to set run status=%s on %s", status, self._meta_key,
+                           exc_info=True)
 
     def set_mooncake_store(self, mooncake_store):
         self._mooncake_store = mooncake_store
@@ -909,7 +990,7 @@ class AsyncTrainingController:
         try:
             self._redis_client.xadd(
                 name=self.redis_train_stream,
-                fields=heartbeat_fields(self._producer_idx),
+                fields=heartbeat_fields(self._producer_idx, self._dataset_epoch),
                 id="*",
                 maxlen=self._stream_maxlen,
                 approximate=True,
@@ -1123,6 +1204,7 @@ class AsyncTrainingController:
                     raise_on_failure=True)
             except Exception:
                 logger.exception("Final eviction failed for %s", k)
+        self._set_run_status(RUN_STATUS_FINISHED)
         try:
             self._redis_client.xadd(name=self.redis_train_stream, fields=eos_fields(), id="*")
         except Exception:

@@ -212,6 +212,9 @@ class RedisConfig:
     heartbeat_seconds: float = 10.0
     train_stream: str = "train_samples"
     eval_stream: str = "eval_samples"
+    # Run metadata hash lives at f"{train_stream}:{meta_key_suffix}" so consumers
+    # derive it from the stream name they already have.
+    meta_key_suffix: str = "meta"
 
 
 

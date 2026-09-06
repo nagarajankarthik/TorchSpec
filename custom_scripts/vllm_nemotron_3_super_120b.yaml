@@ -104,6 +104,10 @@ redis:
   heartbeat_seconds: 10.0
   train_stream: "train_samples"
   eval_stream: "eval_samples"
+  # Run plan (dataset_size, num_epochs, retention TTL, tensor shapes) is
+  # published as a hash at "<train_stream>:<meta_key_suffix>" before the first
+  # sample. Consumers HGETALL it to size their LR schedule.
+  meta_key_suffix: "meta"
 
 output_dir: ./outputs/nemotron_3_120b_test
 cache_dir: ./cache/nemotron_3_120b_test
