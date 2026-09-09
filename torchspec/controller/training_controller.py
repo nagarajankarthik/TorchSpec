@@ -421,6 +421,7 @@ class AsyncTrainingController:
             "status": RUN_STATUS_RUNNING,
             "started_at": str(time.time()),
             "stream": self.redis_train_stream,
+            "heartbeat_seconds": str(self._heartbeat_seconds),
             # --- the run plan ---
             "dataset_size": str(dataset_size),
             "num_epochs": str(num_epochs),
