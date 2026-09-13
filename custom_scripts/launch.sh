@@ -4,9 +4,11 @@
 #SBATCH --job-name=torchspec_infer
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:8
+#SBATCH --gres=gpu:4
 #SBATCH --cpus-per-gpu=16
+#SBATCH --exclude=smc-pod-4
 #SBATCH --ignore-pbs
+#SBATCH --output=/mnt/weka/aisg/users/karthik/model_training_team/TorchSpec/logs/%j.log
 
 #PBS -N torchspec_infer
 #PBS -l select=1:ncpus=64:ngpus=4
@@ -16,7 +18,6 @@
 #PBS -o /scratch_aisg/scratch_aisg/karthik/model_training_team/TorchSpec/logs/
 
 source ~/.bashrc
-set -euo pipefail
 set -x
 
 if [[ -n "${SLURM_JOB_ID:-}" ]] ; then
@@ -48,7 +49,8 @@ CONFIG_FILE="${1:-${BASE_DIR}/TorchSpec/custom_scripts/vllm_nemotron_3_super_120
 export LOG_DIR="${BASE_DIR}/TorchSpec/logs/${JOB_ID}"
 mkdir -p $LOG_DIR
 export MOONCAKE_MASTER_SERVER_ADDRESS="${MASTER_ADDR}"
-export MOONCAKE_ENV_FILE="${LOG_DIR}/mooncake_env.sh"
+export MOONCAKE_ENV_FILE="${BASE_DIR}/TorchSpec/logs/mooncake_env.sh"
+rm -f $MOONCAKE_ENV_FILE
 
 LOCAL_IP=$(hostname -I | awk '{print $1}')
 if [[ -z "${LOCAL_IP}" ]]; then
@@ -94,11 +96,14 @@ done
 # which is what the controller reads. Duplicating them here would let the two
 # drift, and the producer would publish to one stream while consumers blocked
 # on another -- no error, no data.
+echo "" >> "${MOONCAKE_ENV_FILE}"
 cat >> "${MOONCAKE_ENV_FILE}" <<EOF
 export REDIS_HOST=${LOCAL_IP}
 export REDIS_PORT=6390
 EOF
 
+cp ${MOONCAKE_ENV_FILE} ${LOG_DIR}/mooncake_env.sh
+export MOONCAKE_VERIFY_PUTS=1
 
 # 1. Launch vLLM in the background
 # The following comment block in torchspec/inference/engine/vllm_engine should be noted:
@@ -116,17 +121,17 @@ EOF
 # can apply the model's final norm itself on top of this.
 source ${MOONCAKE_ENV_FILE}  
 ${BASE_DIR}/uv_biome/torchspec/bin/python3 -m vllm.entrypoints.openai.api_server \
-    --model nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16 \
-    --max-model-len 16384 \
+    --model aisingapore/Nemotron-3-SEA-LION-v5-120B-A12B-IT-CAND2 \
+    --max-model-len 16385 \
     --load-format instanttensor \
     --gpu-memory-utilization 0.85 \
     --port 8080 \
     --tensor-parallel-size 4 \
     --pipeline-parallel-size 1 \
     --max-num-batched-tokens 65536 \
-    --enable-chunked-prefill \
+    --enable_chunked_prefill \
     --enforce-eager \
-    --speculative-config '{"method": "extract_hidden_states", "num_speculative_tokens": 1, "draft_model_config": {"hf_config": {"eagle_aux_hidden_state_layer_ids": [5, 30, 60, 88]}}}' \
+    --speculative-config '{"method": "extract_hidden_states", "num_speculative_tokens": 1, "draft_model_config": {"hf_config": {"eagle_aux_hidden_state_layer_ids": [2, 13, 23, 33, 44, 55, 65, 75, 86, 88]}}}' \
     --kv-transfer-config '{"kv_connector": "MooncakeHiddenStatesConnector", "kv_connector_module_path": "torchspec.inference.engine.mooncake_hidden_states_connector", "kv_role": "kv_producer"}' &
 
 VLLM_PID=$!

@@ -146,7 +146,8 @@ class VLLMClient:
         self._session: Optional[aiohttp.ClientSession] = None
 
     async def init(self):
-        self._session = aiohttp.ClientSession(timeout=self._timeout)
+        connector = aiohttp.TCPConnector(keepalive_timeout=2)
+        self._session = aiohttp.ClientSession(timeout=self._timeout, connector=connector)
 
     async def shutdown(self):
         if self._session:
@@ -321,7 +322,14 @@ class VLLMClient:
         async with self._session.post(
             f"{self._next_url()}/v1/completions", json=payload
         ) as resp:
-            resp.raise_for_status()
+            if resp.status >= 400:
+                # vLLM's reason (context-length overflow, bad sampling params) is
+                # only in the body; raise_for_status drops it.
+                body = await resp.text()
+                raise RuntimeError(
+                    f"vLLM {resp.status} on /v1/completions "
+                    f"(prompt_tokens={len(prompt_ids)}, max_tokens={max_tokens}): {body[:1000]}"
+                )
             return await resp.json()
 
 
@@ -686,6 +694,11 @@ class AsyncInferenceManager:
                 self.controller.set_inference_error(str(err))
                 return [(entry, err) for entry in entries]
             return list(zip(entries, outputs, strict=True))
+        except aiohttp.ClientError as e:
+            # Transport failure with retries already exhausted. Fail this batch, but do
+            # not escalate — the engine may be perfectly healthy (it was, in 206031).
+            logger.warning("Engine dispatch transport failure: %s", e)
+            return [(entry, e) for entry in entries]
         except Exception as e:
             import traceback
 

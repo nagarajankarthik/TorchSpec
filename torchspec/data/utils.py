@@ -24,13 +24,20 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import torch
-from datasets import IterableDataset, load_dataset
+from datasets import (
+    Dataset,
+    IterableDataset,
+    concatenate_datasets,
+    load_dataset,
+    load_from_disk,
+)
 from huggingface_hub import hf_hub_download, list_repo_files
 
 from torchspec.models.ops.loss_mask import compute_assistant_loss_mask
 
 _LOCAL_DATA_EXTS = frozenset({".json", ".jsonl", ".parquet", ".arrow", ".csv", ".tsv", ".txt"})
 
+_HF_METADATA_FILES = {"state.json", "dataset_info.json", "dataset_dict.json"}
 
 def is_local_data_path(path: str, base_dir: str | None = None) -> bool:
     """True if *path* looks like a local file/directory rather than a HF Hub dataset ID.
@@ -163,26 +170,22 @@ def pack_loss_mask(loss_mask: torch.Tensor) -> List[int]:
         loss_mask = [0, 0, 1, 1, 1, 0, 0, 1, 1, 0]
         returns: [2, 3, 2, 2, 1]  # 2 prompt, 3 response, 2 prompt, 2 response, 1 prompt
     """
+
     if loss_mask.dim() > 1:
         loss_mask = loss_mask.squeeze()
-
-    if len(loss_mask) == 0:
+    if loss_mask.numel() == 0:
         return []
 
-    lengths = []
-    mask_list = loss_mask.tolist()
-    current_val = 0
-    current_len = 0
-
-    for val in mask_list:
-        if val == current_val:
-            current_len += 1
-        else:
-            lengths.append(current_len)
-            current_val = val
-            current_len = 1
-
-    lengths.append(current_len)
+    change = torch.nonzero(loss_mask[1:] != loss_mask[:-1], as_tuple=False).flatten() + 1
+    bounds = torch.cat([
+        torch.zeros(1, dtype=torch.long),
+        change.to(torch.long),
+        torch.tensor([loss_mask.numel()], dtype=torch.long),
+    ])
+    lengths = (bounds[1:] - bounds[:-1]).tolist()
+    # Contract: the list always starts with a prompt run, even a zero-length one.
+    if loss_mask[0].item() != 0:
+        lengths.insert(0, 0)
     return lengths
 
 
@@ -482,6 +485,48 @@ def _load_hub_parquet_dataset(data_path: str):
     return load_dataset("parquet", data_files=urls, split="train", streaming=True)
 
 
+def _load_saved_to_disk(root: Path):
+    """Load ``Dataset.save_to_disk`` output(s) under *root* via their manifests.
+
+    ``state.json`` records which shards belong to the dataset, the order to read
+    them in, and any indices mapping left behind by ``select``/``filter``/
+    ``shuffle``. Globbing ``*.arrow`` discards all three, so prefer the manifest
+    wherever one exists.
+
+    Returns ``None`` when *root* is not a save_to_disk tree, so the caller falls
+    through to the glob path and every other directory layout keeps working.
+    """
+    if (root / "dataset_dict.json").is_file():
+        # Every split below this has its own state.json, so scanning one level
+        # down would silently concatenate train with validation and test.
+        raise ValueError(
+            f"{root} is a DatasetDict, not a Dataset. Point dataset.train_data_path "
+            "at a single split directory beneath it."
+        )
+
+    if (root / "state.json").is_file():
+        roots = [root]
+    else:
+        roots = sorted(
+            p for p in root.iterdir() if p.is_dir() and (p / "state.json").is_file()
+        )
+    if not roots:
+        return None
+
+    parts = []
+    for part_root in roots:
+        part = load_from_disk(str(part_root))
+        if not isinstance(part, Dataset):
+            raise ValueError(
+                f"{part_root} holds a {type(part).__name__} with splits "
+                f"{sorted(part)}; point dataset.train_data_path at one split."
+            )
+        parts.append(part)
+
+    return parts[0] if len(parts) == 1 else concatenate_datasets(parts)
+
+
+
 def load_hf_dataset(data_path: str):
     """Load dataset as a streaming IterableDataset.
 
@@ -500,6 +545,10 @@ def load_hf_dataset(data_path: str):
             return load_dataset(fmt, data_files=data_path, split="train", streaming=True)
 
         if os.path.isdir(data_path):
+            saved = _load_saved_to_disk(Path(data_path))
+            if saved is not None:
+                return saved
+
             patterns = {
                 "json": ["*.json", "*.jsonl"],
                 "parquet": ["*.parquet"],
@@ -508,7 +557,7 @@ def load_hf_dataset(data_path: str):
             for fmt, globs in patterns.items():
                 files = []
                 for g in globs:
-                    files.extend(str(p) for p in Path(data_path).rglob(g))
+                    files.extend(str(p) for p in Path(data_path).rglob(g) if p.name not in _HF_METADATA_FILES)
                 if files:
                     return load_dataset(
                         fmt, data_files=sorted(files), split="train", streaming=True

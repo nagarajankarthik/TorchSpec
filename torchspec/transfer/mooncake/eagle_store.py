@@ -19,6 +19,8 @@
 # SOFTWARE.
 
 import ctypes
+import math
+import os
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -51,6 +53,12 @@ _DTYPE_ELEMENT_SIZES = {
 # Canonical dtype for hidden-state tensors written to / read from Mooncake.
 HIDDEN_STATES_STORAGE_DTYPE = torch.bfloat16
 
+# Diagnostic: count non-finite elements of each payload on the device, before the
+# DtoH staging copy, so a corrupt sample can be attributed to the producer rather
+# than to the transfer. Off by default -- it materializes a full boolean mask per
+# payload on the failure path and costs a device sync per put.
+VERIFY_PUTS = os.getenv("MOONCAKE_VERIFY_PUTS", "0") == "1"
+
 
 class EagleMooncakeStore(MooncakeHiddenStateStore):
     """
@@ -67,6 +75,66 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
     """
 
     TENSOR_SUFFIXES = ["_hs", "_tgt", "_ids", "_lhs"]
+
+    @staticmethod
+    def _enqueue_non_finite_counts(
+        keys: List[str], tensors: List[torch.Tensor]
+    ) -> List[Tuple[str, torch.Tensor, Tuple[int, ...]]]:
+        """Queue a device-side non-finite count for every floating-point payload.
+
+        The reductions are enqueued on the caller's stream *before* the staging copy,
+        so they observe the payload at the same point in stream order that the copy
+        will. Nothing is read back here: an ``.item()`` at this point would insert a
+        host barrier ahead of the DtoH staging and could hide an ordering race
+        between the copy and whatever produced the payload.
+
+        Args:
+            keys: Store keys, positionally aligned with ``tensors``.
+            tensors: Payloads about to be staged. Each floating-point entry is
+                reduced elementwise, with arbitrary shape; integer entries (token
+                ids) cannot be non-finite and are skipped.
+
+        Returns:
+            List of ``(key, count_tensor, shape)``, where ``count_tensor`` is a
+            zero-dimensional device tensor holding the non-finite element count.
+            Empty when verification is disabled.
+        """
+        if not VERIFY_PUTS:
+            return []
+        pending: List[Tuple[str, torch.Tensor, Tuple[int, ...]]] = []
+        for entry_key, tensor in zip(keys, tensors):
+            if tensor.is_floating_point() and tensor.numel() > 0:
+                pending.append((entry_key, (~torch.isfinite(tensor)).sum(), tuple(tensor.shape)))
+        return pending
+
+    @staticmethod
+    def _report_non_finite_counts(
+        key: str, pending: List[Tuple[str, torch.Tensor, Tuple[int, ...]]]
+    ) -> None:
+        """Read back queued non-finite counts and log any corrupt payload.
+
+        A hit here means the payload was already corrupt on the device, before the
+        staging copy and the RDMA transfer -- so the corruption came from whatever
+        produced it, not from this store. The count and shape match the consumer's
+        ingest report field for field, so a producer line and a consumer line can be
+        tied to the same sample.
+
+        Args:
+            key: Base store key, for correlation with consumer-side reports.
+            pending: Entries returned by :meth:`_enqueue_non_finite_counts`.
+        """
+        for entry_key, count_tensor, shape in pending:
+            count = int(count_tensor.item())
+            if count:
+                logger.warning(
+                    "put: key=%s entry=%s is non-finite on device before staging: "
+                    "count=%d/%d shape=%s",
+                    key,
+                    entry_key,
+                    count,
+                    math.prod(shape),
+                    shape,
+                )
 
     def _put_raw_tensors(self, keys: List[str], tensors: List[torch.Tensor]) -> None:
         if self._gpu_direct_available and self._gpu_send_buffer is not None:
@@ -253,7 +321,14 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
             keys.append(f"{key}_lhs")
             tensors.append(last_hidden_states)
 
+        # Enqueued before the staging copy, so it observes the same data state in
+        # stream order, but read back only after submit so no host barrier is
+        # inserted ahead of the path under investigation.
+        pending_counts = self._enqueue_non_finite_counts(keys, tensors)
+
         self._put_raw_tensors(keys, tensors)
+
+        self._report_non_finite_counts(key, pending_counts)
 
         shapes = {
             "hidden_states": tuple(hidden_states.shape),

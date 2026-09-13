@@ -66,7 +66,7 @@ _PRETOKENIZED_CONTRACT_COLUMNS = frozenset(
         "loss_tokens",
     }
 )
-
+_INTEGER_DTYPES = (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64)
 
 def _is_pretokenized_dataset(dataset) -> bool:
     """Return whether an HF dataset exposes the offline token/mask contract."""
@@ -98,57 +98,79 @@ def _pretokenized_metadata(sample) -> dict:
         and isinstance(value, (str, int, float, bool))
     }
 
-
 def _load_pretokenized_dataset(dataset, *, max_length: int, total=None):
-    """Load already-rendered rows without applying a chat template again."""
+    """Load already-rendered rows without applying a chat template again.
+
+    Validation runs as whole-tensor operations rather than per-token Python: at
+    16k tokens a row, an ``isinstance`` sweep or a ``.tolist()`` comparison costs
+    more than everything else in this loop put together.
+    """
     prompts = []
     seen_ids = set()
     for idx, sample in enumerate(tqdm(dataset, desc="Loading pretokenized dataset", total=total)):
-        input_ids = sample.get("input_ids")
-        if hasattr(input_ids, "tolist"):
-            input_ids = input_ids.tolist()
-        if not isinstance(input_ids, list) or any(not isinstance(v, int) for v in input_ids):
+        # Dtype inference does the type checking: a list of Python ints infers an
+        # integer dtype; a float or a string anywhere in the row does not.
+        try:
+            ids = torch.as_tensor(sample.get("input_ids"))
+        except Exception as e:
+            raise ValueError(f"Pretokenized sample {idx} has invalid input_ids") from e
+        if ids.dim() != 1 or ids.dtype not in _INTEGER_DTYPES:
             raise ValueError(f"Pretokenized sample {idx} has invalid input_ids")
-        if not input_ids:
+        seq_len = ids.numel()
+        if seq_len == 0:
             raise ValueError(f"Pretokenized sample {idx} has empty input_ids")
         # Truncating here would drop supervised tokens the producer counted on,
         # so an over-length row is a corpus/config mismatch, not something to fix
         # silently.
-        if len(input_ids) > max_length:
+        if seq_len > max_length:
             raise ValueError(
-                f"Pretokenized sample {idx} has seq_len={len(input_ids)} above "
+                f"Pretokenized sample {idx} has seq_len={seq_len} above "
                 f"max_seq_length={max_length}; retokenize the corpus at this limit "
                 f"or raise max_seq_length instead of truncating"
             )
         stored_seq_len = sample.get("seq_len")
-        if stored_seq_len is not None and int(stored_seq_len) != len(input_ids):
+        if stored_seq_len is not None and int(stored_seq_len) != seq_len:
             raise ValueError(f"Pretokenized sample {idx} seq_len metadata does not match input_ids")
 
-        packed_loss_mask = sample.get("packed_loss_mask")
-        explicit_loss_mask = sample.get("loss_mask")
-        if hasattr(explicit_loss_mask, "tolist"):
-            explicit_loss_mask = explicit_loss_mask.tolist()
-        if packed_loss_mask is None:
-            if not isinstance(explicit_loss_mask, list):
+        explicit_raw = sample.get("loss_mask")
+        packed_str = sample.get("packed_loss_mask")
+        if explicit_raw is None:
+            explicit_t = None
+        else:
+            try:
+                explicit_t = torch.as_tensor(explicit_raw, dtype=torch.long)
+            except Exception as e:
+                raise ValueError(f"Pretokenized sample {idx} has an invalid loss mask") from e
+
+        if packed_str is None:
+            if explicit_t is None:
                 raise ValueError(f"Pretokenized sample {idx} is missing its loss mask")
-            packed_loss_mask = serialize_packed_loss_mask(
-                pack_loss_mask(torch.tensor(explicit_loss_mask, dtype=torch.long))
-            )
-        segments = deserialize_packed_loss_mask(packed_loss_mask)
-        if any(length < 0 for length in segments) or sum(segments) != len(input_ids):
+            # Derivation, not validation: packed_loss_mask is the output contract
+            # (engines consume it as a "2,3,2,2,1" string), so it has to be built.
+            # Keep the list pack_loss_mask returns instead of serializing it and
+            # parsing the string straight back.
+            segments = pack_loss_mask(explicit_t)
+            packed_str = serialize_packed_loss_mask(segments)
+            cross_check = False
+        else:
+            segments = deserialize_packed_loss_mask(packed_str)
+            # Comparing the two encodings says something about the corpus only when
+            # both came off disk. Against a mask derived one line ago it would be
+            # testing pack/unpack, at O(seq_len) per row.
+            cross_check = explicit_t is not None
+
+        if any(length < 0 for length in segments) or sum(segments) != seq_len:
             raise ValueError(
                 f"Pretokenized sample {idx} packed_loss_mask length does not match input_ids"
             )
         packed_loss_tokens = sum(segments[1::2])
         if packed_loss_tokens <= 0:
             raise ValueError(f"Pretokenized sample {idx} has no supervised tokens")
-        # Both mask encodings may be present; disagreement means the producer
-        # wrote them from different states and neither can be trusted.
-        if explicit_loss_mask is not None:
-            if (
-                not isinstance(explicit_loss_mask, list)
-                or explicit_loss_mask != unpack_loss_mask(packed_loss_mask).tolist()
-            ):
+        # Both encodings present and independently written: disagreement means the
+        # producer wrote them from different states and neither can be trusted.
+        if cross_check:
+            unpacked = unpack_loss_mask(packed_str)
+            if explicit_t.shape != unpacked.shape or not torch.equal(explicit_t, unpacked):
                 raise ValueError(
                     f"Pretokenized sample {idx} explicit loss_mask disagrees with packed mask"
                 )
@@ -162,17 +184,24 @@ def _load_pretokenized_dataset(dataset, *, max_length: int, total=None):
         if data_id in seen_ids:
             raise ValueError(f"Duplicate pretokenized data_id: {data_id}")
         seen_ids.add(data_id)
+        # as_tensor can alias a numpy/Arrow-backed buffer, and prompts outlives the
+        # row, so make sure the stored tensor owns its memory -- exactly one copy
+        # either way, since .to() already copies when the dtype differs.
+        input_ids = ids.to(torch.long)
+        if input_ids is ids:
+            input_ids = input_ids.clone()
         prompts.append(
             {
                 "data_id": data_id,
-                "input_ids": torch.tensor(input_ids, dtype=torch.long),
-                "packed_loss_mask": packed_loss_mask,
+                "input_ids": input_ids,
+                "packed_loss_mask": packed_str,
                 "formatted_prompt": None,
                 "multimodal_inputs": None,
                 "metadata": _pretokenized_metadata(sample),
             }
         )
     return prompts
+
 
 
 def _init_tokenize_worker(
@@ -367,6 +396,11 @@ def load_conversation_dataset(args):
         raise ValueError(f"Unknown dataset renderer {renderer_name!r}; available: {available}")
 
     hf_dataset = load_hf_dataset(args.train_data_path)
+
+    if hasattr(hf_dataset, "with_format"):
+        fmt_cols = [c for c in ("input_ids", "loss_mask") if c in (hf_dataset.column_names or ())]
+        if fmt_cols:
+            hf_dataset = hf_dataset.with_format("torch", columns=fmt_cols, output_all_columns=True)
 
     # Detection comes before the renderer/template requirement below: a
     # pretokenized corpus is never rendered, so a config that sets neither is
