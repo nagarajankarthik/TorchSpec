@@ -16,14 +16,14 @@
 # Note: Uses vLLM's extract_hidden_states speculative method with MooncakeHiddenStatesConnector.
 
 model:
-  target_model_path: aisingapore/Nemotron-3-SEA-LION-v5-120B-A12B-IT-CAND2
+  target_model_path: aisingapore/Nemotron-SEA-LION-v5-120B-A12B
   embedding_key: backbone.embeddings.weight
   lm_head_key: lm_head.weight
   norm_key: backbone.norm_f.weight
   trust_remote_code: true
 
 dataset:
-  train_data_path: /mnt/weka/aisg/users/karthik/model_training_team/data_bank/dflash_nemotron_3_super_120b_a12b_cand2/nemotron_competitive_programming_v1
+  train_data_path: /mnt/weka/aisg/users/karthik/model_training_team/data_bank/dflash_nemotron_3_super_120b_a12b_cand2
   eval_data_path: null
   eval_interval: 1000
   # chat_template is not used for 
@@ -58,6 +58,8 @@ inference:
   # the model's num_hidden_layers (88) as eagle_aux_hidden_state_layer_ids,
   # i.e. [5, 30, 60, 88]. len(this list) must equal mooncake.num_aux_layers.
   aux_hidden_states_layers: [1, 12, 22, 32, 43, 54, 64, 74, 85]
+  # aux_hidden_states_layers: [1, 22, 43, 64, 85]
+
   vllm:
     endpoints: ["http://127.0.0.1:8080"]
     timeout_s: 1800.0
