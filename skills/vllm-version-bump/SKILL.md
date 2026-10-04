@@ -119,7 +119,7 @@ criteria as Phase 3.
 | pip `versions: none` for mooncake during image build | aarch64 mooncake wheels need glibc ≥ 2.39; image is Ubuntu 22.04 (2.35) | Don't install mooncake in the image |
 | Patch layer: `Hunk #N FAILED` | Upstream code shifted | Regenerate the hunk per Phase 1 |
 | `ModuleNotFoundError: flash_attn.ops.triton.rotary` at engine init | FA4 guard hunk missing or not applied | Phase 1 known hunk |
-| Warning: `Model runner v2 does not yet support ... extract_hidden_states; using the v1 model runner` | Upstream fallback | OK while v1 runner exists; if a release removes it, STOP — extract_hidden_states needs vLLM-side work first |
+| Warning: `Model Runner V2 does not yet support ...; using the V1 model runner instead.` | Some *other* config feature triggered the V1 fallback — not `extract_hidden_states`, which V2 supports as of v0.29.0 | Read which feature the warning names and drop it. The fallback is no longer harmless: a model that ships `get_model_state_cls()` (e.g. Qwen4Exp, whose `Qwen4ExpModelState` supplies the PLE n-gram inputs) runs **only** on V2 and raises `RuntimeError: PLE inputs were not prepared` on V1. Source of truth: `_get_v2_model_runner_unsupported_features` in `vllm/config/vllm.py` |
 | Training hangs with `Sample pool full, pausing generation` only | Backpressure working; training side stalled for another reason | Check trainer actor logs, not inference |
 
 ## Red flags — you are about to ship a broken bump

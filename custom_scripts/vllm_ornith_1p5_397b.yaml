@@ -22,7 +22,7 @@ model:
   trust_remote_code: true
 
 dataset:
-  train_data_path: /mnt/weka/aisg/users/karthik/model_training_team/data_bank/dflash_ornith_1p5_train
+  train_data_path: /mnt/weka/aisg/users/karthik/model_training_team/data_bank/dflash_ornith_1p5_train/sea_instruct_2602_sampled
   eval_data_path: null
   eval_interval: 1000
   # chat_template is not used for 
@@ -64,8 +64,9 @@ inference:
     # Mirrors launch.sh -- not read here.
     tp_size: 8
     extra_args:
-      max_num_batched_tokens: 65536
+      max_num_batched_tokens: 16384
       enable_chunked_prefill: true
+      enable_expert_parallel: true
       enforce_eager: true
 
 mooncake:

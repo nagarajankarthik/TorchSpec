@@ -104,20 +104,11 @@ EOF
 export MOONCAKE_VERIFY_PUTS=0
 
 # 1. Launch vLLM in the background
-# The following comment block in torchspec/inference/engine/vllm_engine should be noted:
-# Layer IDs use post-layer semantics: "capture the residual stream
-# after layer N runs".  vllm's capture hook fires at the INPUT of each
-# listed layer (= output of the previous layer), so we shift by +1 to
-# align with sglang's convention.
-# vllm's `_maybe_add_hidden_state` is called with `layer_idx + 1`
-# *after* each layer runs, so valid capture indices are
-# [0, num_hidden_layers]; we keep ids up to num_hidden_layers
-# (the pre-`norm` slot, see final-layer block below).
-# Append the model's final layer to capture last_hidden_states
-# (pre-norm) for target logit computation.  Index `num_hidden_layers`
-# is vllm's reserved post-last-layer / pre-`norm` slot, so training
-# can apply the model's final norm itself on top of this.
-source ${MOONCAKE_ENV_FILE}  
+source ${MOONCAKE_ENV_FILE}
+
+# The aux hidden-state layer ID convention behind --speculative-config below
+# (the +1 shift and the trailing num_hidden_layers slot) is explained in
+# custom_scripts/README.md. Read it before changing those ids.
 ${BASE_DIR}/uv_biome/torchspec/bin/python3 -m vllm.entrypoints.openai.api_server \
     --model aisingapore/Nemotron-SEA-LION-v5-120B-A12B \
     --max-model-len 16385 \

@@ -37,7 +37,11 @@ elif [[ -n "${PBS_JOBID:-}" ]] ; then
 fi
 
 export GPUS_PER_NODE=$(nvidia-smi --list-gpus | wc -l)
-export TORCHINDUCTOR_CACHE_DIR="${TMPDIR:-/tmp}/cache/compiled_kernels"
+# Persistent across jobs: $TMPDIR is node-local, so every job recompiled the
+# inductor kernels from scratch. vllm's own compiled artifacts live under
+# VLLM_CACHE_ROOT (~/.cache/vllm), which is already weka-backed.
+export TORCHINDUCTOR_CACHE_DIR="${BASE_DIR}/TorchSpec/cache/inductor"
+mkdir -p "${TORCHINDUCTOR_CACHE_DIR}"
 export TORCHSPEC_LOG_LEVEL=DEBUG
 
 cd ${BASE_DIR}/TorchSpec
@@ -104,31 +108,39 @@ EOF
 export MOONCAKE_VERIFY_PUTS=0
 
 # 1. Launch vLLM in the background
-# The following comment block in torchspec/inference/engine/vllm_engine should be noted:
-# Layer IDs use post-layer semantics: "capture the residual stream
-# after layer N runs".  vllm's capture hook fires at the INPUT of each
-# listed layer (= output of the previous layer), so we shift by +1 to
-# align with sglang's convention.
-# vllm's `_maybe_add_hidden_state` is called with `layer_idx + 1`
-# *after* each layer runs, so valid capture indices are
-# [0, num_hidden_layers]; we keep ids up to num_hidden_layers
-# (the pre-`norm` slot, see final-layer block below).
-# Append the model's final layer to capture last_hidden_states
-# (pre-norm) for target logit computation.  Index `num_hidden_layers`
-# is vllm's reserved post-last-layer / pre-`norm` slot, so training
-# can apply the model's final norm itself on top of this.
-source ${MOONCAKE_ENV_FILE}  
+source ${MOONCAKE_ENV_FILE}
+
+# KV-cache geometry, the prefix-caching requirement, the aux hidden-state layer
+# ID convention and the torch.compile staging plan are all explained in
+# custom_scripts/README.md. Read it before changing any flag below.
+#
+# Exactly one COMPILE_ARGS line should be uncommented. Validate hidden states
+# against an eager run before advancing a stage.
+
+# Stage 1 (active): inductor only, no graph capture.
+COMPILE_ARGS=(-cc.mode=3 -cc.cudagraph_mode=NONE)
+
+# Stage 2: add piecewise graphs; attention stays outside the graph.
+# COMPILE_ARGS=(-cc.mode=3 -cc.cudagraph_mode=PIECEWISE -cc.cudagraph_capture_sizes='[1,2,4,8,16]')
+
+# Stage 3: vllm's v1 default -- full graphs for decode, piecewise for prefill.
+# COMPILE_ARGS=(-cc.mode=3 -cc.cudagraph_mode=FULL_AND_PIECEWISE -cc.cudagraph_capture_sizes='[1,2,4,8,16]')
+
+# Rollback to the previous behaviour:
+# COMPILE_ARGS=(--enforce-eager)
+
 ${BASE_DIR}/uv_biome/torchspec/bin/python3 -m vllm.entrypoints.openai.api_server \
     --model ornith-ai/Ornith-1.5-397B \
     --max-model-len 16385 \
     --load-format instanttensor \
-    --gpu-memory-utilization 0.95 \
+    --gpu-memory-utilization 0.90 \
     --port 8080 \
     --tensor-parallel-size 8 \
     --pipeline-parallel-size 1 \
-    --max-num-batched-tokens 65536 \
-    --enable_chunked_prefill \
-    --enforce-eager \
+    --max-num-batched-tokens 16384 \
+    --enable-chunked-prefill \
+    --enable-expert-parallel \
+    "${COMPILE_ARGS[@]}" \
     --speculative-config '{"method": "extract_hidden_states", "num_speculative_tokens": 1, "draft_model_config": {"hf_config": {"eagle_aux_hidden_state_layer_ids": [2, 10, 18, 26, 34, 42, 50, 58, 60]}}}' \
     --kv-transfer-config '{"kv_connector": "MooncakeHiddenStatesConnector", "kv_connector_module_path": "torchspec.inference.engine.mooncake_hidden_states_connector", "kv_role": "kv_producer"}' &
 
