@@ -1,0 +1,82 @@
+
+dataset:
+  train_data_path: /mnt/weka/aisg/users/karthik/model_training_team/data_bank/aisg_qwen3p5_397b_a17b_flash_next_train
+  eval_data_path: null
+  eval_interval: 1000
+  # chat_template is not used for 
+  # pre-tokenized datasets
+  chat_template: qwen
+  prompt_key: conversations
+  defer_tokenization: false
+
+training:
+  num_epochs: 99999
+  max_seq_length: 16384
+  max_concurrent_batches: 32
+
+# Read by this path (train_entry -> AsyncInferenceManager -> VLLMClient):
+#   inference_engine_type, max_sample_pool_size, inference_buffer_threshold,
+#   inference_batch_size, aux_hidden_states_layers, vllm.endpoints, vllm.timeout_s
+# Also read but not set here: inference_fetch_batch (defaults to 1).
+inference:
+  inference_engine_type: vllm
+  max_sample_pool_size: 64
+  inference_buffer_threshold: 32
+  inference_batch_size: 1
+  # Post-layer semantics. launch.sh must pass [id + 1 for id in this list] plus
+  # the model's num_hidden_layers (60) as eagle_aux_hidden_state_layer_ids,
+  # len(this list) must equal mooncake.num_aux_layers.
+  aux_hidden_states_layers: [1, 9, 17, 25, 33, 41, 49, 57]
+
+  vllm:
+    endpoints: ["http://127.0.0.1:8080"]
+    timeout_s: 1800.0
+
+mooncake:
+  protocol: rdma
+  # TODO: Verify this by running ibv_devinfo
+  device_name: mlx5_0
+  hidden_dim: 4096
+  max_seq_len: 16384
+  num_aux_layers: 8
+  global_segment_size: 256GB
+  local_buffer_size: 8GB
+  master_server_address: null
+  master_port: 8011
+  metadata_server: null
+  metadata_port: 8012
+  # Must match --metrics_port in launch.sh; the controller scrapes it for backpressure.
+  metrics_port: 8013
+  # Pause generation at this fraction of master capacity. Must stay below the
+  # master's own eviction_high_watermark_ratio (0.90), which drops unread objects.
+  watermark_fraction: 0.75
+  sample_eviction_ttl_seconds: 75
+  sample_eviction_check_interval: 1.0
+  enable_hard_pin: true
+
+redis:
+  # Samples per XADD pipeline round trip. Publish granularity only -- it no
+  # longer has any relationship to the trainers' data-parallel degree.
+  dispatch_batch_size: 2
+  # (max_attempts - 1) * retry_seconds = 2s of dispatch-loop blocking worst
+  # case. Keep well under mooncake.sample_eviction_ttl_seconds.
+  publish_max_attempts: 2
+  publish_retry_seconds: 2
+  # Must exceed watermark * global_segment_size / bytes_per_shortest_sample,
+  # i.e. the most samples Mooncake can hold at once. Checked at startup.
+  stream_maxlen: 32768
+  min_expected_seq_len: 128
+  heartbeat_seconds: 10.0
+  train_stream: "train_samples"
+  eval_stream: "eval_samples"
+  # Run plan (dataset_size, num_epochs, retention TTL, tensor shapes) is
+  # published as a hash at "<train_stream>:<meta_key_suffix>" before the first
+  # sample. Consumers HGETALL it to size their LR schedule.
+  meta_key_suffix: "meta"
+
+output_dir: ./outputs/aisg_qwen3p5_flash_next
+cache_dir: ./cache/aisg_qwen3p5_flash_next
+model_download_dir: null
+
+debug:
+  save_debug_train_data: null
