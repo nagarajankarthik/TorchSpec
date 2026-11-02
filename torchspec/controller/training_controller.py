@@ -413,6 +413,16 @@ class AsyncTrainingController:
         direction, because EOS stops the run regardless.
         """
         num_epochs = getattr(self.args, "num_epochs", 1)
+        # Post-layer numbering (id i = output of decoder layer i). Unset means the
+        # engine picked its own default, which this process cannot see, so publish
+        # nothing rather than a guess.
+        aux_layer_ids = getattr(self.args, "aux_hidden_states_layers", None)
+        num_aux = getattr(self.args, "mooncake_num_aux_layers", None)
+        if aux_layer_ids is not None and num_aux is not None and len(aux_layer_ids) != int(num_aux):
+            raise ValueError(
+                f"inference.aux_hidden_states_layers {list(aux_layer_ids)} must have "
+                f"mooncake.num_aux_layers={num_aux} entries"
+            )
         meta = {
             "v": STREAM_SCHEMA_VERSION,
             # Guards against a consumer reading a previous run's plan if this
@@ -433,6 +443,9 @@ class AsyncTrainingController:
             # deep in the Mooncake fetch path ---
             "hidden_dim": str(getattr(self.args, "mooncake_hidden_dim", "")),
             "num_aux_layers": str(getattr(self.args, "mooncake_num_aux_layers", "")),
+            "aux_layer_ids": (
+                json.dumps([int(i) for i in aux_layer_ids]) if aux_layer_ids is not None else ""
+            ),
             "max_seq_len": str(getattr(self.args, "mooncake_max_seq_len", "")),
         }
         self._redis_client.hset(self._meta_key, mapping=meta)
