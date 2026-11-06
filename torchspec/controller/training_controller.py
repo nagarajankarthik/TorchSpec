@@ -40,21 +40,23 @@ Batch Size Design:
 """
 
 import copy
+import json
+import os
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-import torch
-import json
 from typing import Any, Dict, Optional, Tuple
-import redis
-import os
 
+import redis
+import torch
+
+from torchspec.controller.generation_progress import GenerationProgress
 from torchspec.data.utils import length_grouped_order
+from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
 from torchspec.utils.logging import logger
 from torchspec.utils.memory import estimate_tensor_bytes
 from torchspec.utils.types import InferenceInput, InferenceOutput
-from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
 
 _estimate_bytes = estimate_tensor_bytes
 
@@ -288,8 +290,8 @@ class AsyncTrainingController:
         self.redis_train_stream = getattr(args, "redis_train_stream", "train_samples")
         self.redis_eval_stream = getattr(args, "redis_eval_stream", "eval_samples")
         self._redis_client = redis.Redis(
-                host=redis_host, 
-                port=redis_port, 
+                host=redis_host,
+                port=redis_port,
                 decode_responses=True,
                 socket_timeout=5.0,
                 socket_connect_timeout=5.0)
@@ -327,6 +329,8 @@ class AsyncTrainingController:
         self._dataset_seed: int = getattr(args, "seed", 42)
         self._shuffle_dataset: bool = getattr(args, "shuffle_dataset", True)
         self._length_group_size: int = getattr(args, "length_group_size", 32)
+        self._progress: GenerationProgress | None = None
+        self._progress_path: str | None = None
 
         self._start_time = time.time()
         self._inference_monitor = SpeedMonitor(window_seconds=10.0)
@@ -563,14 +567,13 @@ class AsyncTrainingController:
         logger.info(f"Controller loaded dataset: {len(self._stored_dataset)} samples")
         return len(self._stored_dataset)
 
-    def _prepare_dataset(self, skip: int = 0) -> list:
+    def _prepare_dataset(self, exclude_published: bool = False) -> list:
         """Return dataset for the current epoch, optionally shuffled and length-grouped.
 
         When shuffle is enabled the ordering is deterministic from
-        (seed + epoch), so resume can reconstruct the same epoch ordering
-        and approximately skip samples consumed by completed optimizer
-        steps.  This is best-effort only because async prompt/result
-        buffers may still contain in-flight samples.
+        (seed + epoch), so a resumed epoch keeps its original order.
+        ``exclude_published`` drops rows the progress record says this epoch
+        has already published, so a restarted job owes exactly the rest.
         """
         data = list(self._stored_dataset)
         if self._shuffle_dataset:
@@ -581,9 +584,12 @@ class AsyncTrainingController:
 
         data = length_grouped_order(data, self._length_group_size)
 
-        if skip > 0:
-            skip = min(skip, len(data))
-            data = data[skip:]
+        skip = 0
+        if exclude_published and self._progress is not None:
+            epoch = self._dataset_epoch
+            remaining = [s for s in data if not self._progress.is_published(epoch, s["data_id"])]
+            skip = len(data) - len(remaining)
+            data = remaining
 
         shuffle_tag = (
             f"seed {self._dataset_seed}+{self._dataset_epoch}"
@@ -592,26 +598,94 @@ class AsyncTrainingController:
         )
         logger.info(
             f"Prepared dataset ({len(data)} samples, {shuffle_tag}, "
-            f"length group {self._length_group_size}" + (f", skipped {skip})" if skip > 0 else ")")
+            f"length group {self._length_group_size}"
+            + (f", skipped {skip} already published)" if skip > 0 else ")")
         )
         return data
 
-    def submit_training_dataset(self, epoch: int = 0, skip: int = 0) -> int:
+    def submit_training_dataset(self) -> int:
         """Submit the stored training dataset to the prompt buffer for inference.
 
-        Args:
-            epoch: Current epoch number (for deterministic shuffle seed).
-            skip: Number of samples to skip from the start (for resume mid-epoch).
+        A fresh run submits epoch 0. A resumed run submits, oldest first, every
+        epoch with rows still owed, minus the rows already published; if none
+        are owed it starts the next epoch.
         """
         assert self._stored_dataset is not None, "No stored dataset to submit"
-        self._dataset_epoch = epoch
-        return self.add_dataset(self._prepare_dataset(skip=skip))
+        if self._progress is None:
+            self._dataset_epoch = 0
+            return self.add_dataset(self._prepare_dataset())
+        total = 0
+        for epoch in self._progress.resume_epochs():
+            self._dataset_epoch = epoch
+            self._progress.open_epoch(epoch)
+            total += self.add_dataset(self._prepare_dataset(exclude_published=True))
+        # A row is credited to the oldest epoch missing it, so a newer epoch
+        # cannot finish while an older one owes rows: the last epoch submitted
+        # above is the newest ever started, and reload_dataset continues from it.
+        return total
 
     def reload_dataset(self) -> int:
         """Re-add the stored dataset to the prompt buffer (epoch reload)."""
         assert self._stored_dataset is not None, "No stored dataset to reload"
         self._dataset_epoch += 1
+        if self._progress is not None:
+            self._progress.open_epoch(self._dataset_epoch)
         return self.add_dataset(self._prepare_dataset())
+
+    # ─────────────────────────────────────────────────────────────
+    # Generation progress (resume after a killed job)
+    # ─────────────────────────────────────────────────────────────
+
+    def enable_progress(self, path: str, *, resume: bool) -> None:
+        """Track published rows in ``path``; with ``resume``, continue from it.
+
+        Must run after load_dataset and before submit_training_dataset. Every
+        row needs a stable ``data_id``: generated ids are renumbered each
+        epoch, so they cannot identify a row across jobs.
+        """
+        assert self._stored_dataset is not None, "load_dataset() must run first"
+        data_ids = []
+        for i, sample in enumerate(self._stored_dataset):
+            data_id = sample.get("data_id") if isinstance(sample, dict) else None
+            if not data_id:
+                raise ValueError(
+                    f"Row {i} has no data_id, so generation progress cannot be tracked"
+                )
+            data_ids.append(str(data_id))
+        progress = GenerationProgress(
+            data_ids,
+            fingerprint={"train_data_path": str(getattr(self.args, "train_data_path", ""))},
+        )
+        if resume and os.path.exists(path):
+            progress.load(path)
+        elif resume:
+            logger.info("No generation progress at %s; starting from epoch 0", path)
+        self._progress = progress
+        self._progress_path = path
+
+    def get_resume_state(self) -> dict:
+        """Where the loop should pick up. All zeros for a fresh run.
+
+        Call after submit_training_dataset, which settles the current epoch.
+        """
+        if self._progress is None or not self._progress.resumed:
+            return {"completed_steps": 0, "epoch": self._dataset_epoch, "published_in_epoch": 0}
+        return {
+            "completed_steps": int(self._progress.loop_state.get("completed_steps", 0)),
+            "epoch": self._dataset_epoch,
+            "published_in_epoch": self._progress.published_in(self._dataset_epoch),
+        }
+
+    def save_progress(self, loop_state: dict) -> None:
+        """Persist progress. A failed write is logged, not raised: losing one
+        save costs a few duplicate samples, while raising would end the run."""
+        if self._progress is None:
+            return
+        self._progress.loop_state = dict(loop_state)
+        try:
+            self._progress.save(self._progress_path)
+        except Exception:
+            logger.exception("Failed to save generation progress to %s", self._progress_path)
 
     def load_eval_dataset(self, args) -> int:
         """Not supported: the eval path still assumes per-DP-rank queues."""
@@ -882,6 +956,12 @@ class AsyncTrainingController:
                 break
             if attempt < self._publish_max_attempts:
                 time.sleep(self._publish_retry_seconds)
+
+        if self._progress is not None and stream_name == self.redis_train_stream:
+            failed = {id(s) for s in pending}
+            for s in samples:
+                if id(s) not in failed:
+                    self._progress.mark_published(s.data_id)
 
         if pending:
             self._publish_dropped += len(pending)

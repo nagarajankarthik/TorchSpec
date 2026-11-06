@@ -135,6 +135,14 @@ class TrainingConfig:
     save_per_epoch: bool = False
     max_checkpoints: int = 0  # 0 = keep all, N > 0 = rotate and keep only N most recent
     seed: int = 0
+    # Generation progress (which rows have been published), so a job killed at
+    # walltime can be resubmitted and continue. Kept at
+    # <output_dir>/generation_progress.json unless generation_progress_file is
+    # set. A run refuses to start over an existing file unless
+    # resume_generation is true.
+    resume_generation: bool = False
+    generation_progress_file: Optional[str] = None
+    generation_progress_save_seconds: float = 60.0
     train_backend: str = "fsdp"
     train_env_vars: str = "{}"
     train_with_decode: bool = False
@@ -241,6 +249,7 @@ _ALWAYS_LOCAL_PATH_KEYS = (
     "model_download_dir",
     "inference.offline.data_path",
     "model.initial_draft_model_path",
+    "training.generation_progress_file",
 )
 _DATA_PATH_KEYS = ("dataset.train_data_path", "dataset.eval_data_path")
 

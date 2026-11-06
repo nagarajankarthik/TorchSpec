@@ -1,9 +1,6 @@
 """Tests for length grouping."""
 
-import importlib
-import sys
 from dataclasses import dataclass
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -80,12 +77,18 @@ class MockArgs:
     length_group_size: int = 8
 
 
+@pytest.fixture(autouse=True)
+def _redis_env(monkeypatch):
+    # The controller builds a Redis client at construction; it connects lazily,
+    # so nothing needs to be listening.
+    monkeypatch.setenv("REDIS_HOST", "127.0.0.1")
+    monkeypatch.setenv("REDIS_PORT", "6379")
+
+
 def controller(dataset, **overrides):
-    module_name = "torchspec.controller.training_controller"
-    sys.modules.pop(module_name, None)
-    with patch("ray.remote", lambda cls: cls):
-        module = importlib.import_module(module_name)
-    actor = module.AsyncTrainingController(MockArgs(**overrides), dp_size=2)
+    from torchspec.controller.training_controller import AsyncTrainingController
+
+    actor = AsyncTrainingController(MockArgs(**overrides))
     actor._stored_dataset = dataset
     return actor
 
@@ -115,9 +118,17 @@ def test_same_epoch_rebuilds_the_same_order():
     assert [e["data_id"] for e in first] == [e["data_id"] for e in second]
 
 
-def test_skip_slices_the_grouped_order():
+def test_exclude_published_keeps_the_grouped_order(tmp_path):
     actor = controller(SHUFFLE_ME)
-    assert actor._prepare_dataset(skip=10) == actor._prepare_dataset()[10:]
+    actor.enable_progress(str(tmp_path / "progress.json"), resume=False)
+    actor._progress.open_epoch(0)
+    full = actor._prepare_dataset()
+    published = {e["data_id"] for e in full[::3]}
+    for data_id in published:
+        actor._progress.mark_published(data_id)
+
+    remaining = actor._prepare_dataset(exclude_published=True)
+    assert remaining == [e for e in full if e["data_id"] not in published]
 
 
 def test_each_epoch_groups_different_samples_together():

@@ -195,6 +195,11 @@ else
 fi
 
 
+# resume_generation=true: a job killed at walltime is resubmitted with this same
+# script and continues from <output_dir>/generation_progress.json, skipping
+# rows already published. With no progress file it starts from epoch 0. To
+# start over deliberately, move that file away first.
 ${BASE_DIR}/uv_biome/torchspec/bin/python3 -m torchspec.train_entry \
     --config "$CONFIG_FILE" \
-    mooncake.local_hostname=${LOCAL_IP}
+    mooncake.local_hostname=${LOCAL_IP} \
+    training.resume_generation=true

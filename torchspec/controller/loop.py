@@ -22,7 +22,9 @@
 
 import re
 import shutil
+import signal
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -248,13 +250,11 @@ def training_loop(
                 )
 
     # Submit training data AFTER eval hs generation so that training prompts don't
-    # leak into the inference pipeline during eval.
-    # Resume is best-effort: completed optimizer steps determine epoch/skip, but
-    # async prompt/result buffers can still lose or replay a small tail.
-    start_step = getattr(args, "resume_from_step", 0)
-    resume_epoch = start_step // steps_per_epoch if steps_per_epoch > 0 else 0
-    resume_skip = (start_step % steps_per_epoch) * controller.dispatch_batch_size if start_step > 0 else 0
-    controller.submit_training_dataset(epoch=resume_epoch, skip=resume_skip)
+    # leak into the inference pipeline during eval. On a resumed run this submits
+    # only the rows the progress record says are still owed.
+    controller.submit_training_dataset()
+    resume = controller.get_resume_state()
+    start_step = min(resume["completed_steps"], num_steps)
 
     startup_deadline = time.monotonic() + 60
     while _pipeline_idle():
@@ -269,38 +269,69 @@ def training_loop(
     )
 
     completed_steps = start_step
-    current_epoch = completed_steps // steps_per_epoch + 1
-    steps_in_current_epoch = completed_steps % steps_per_epoch
+    # Controller epochs are 0-based; this counter has always been 1-based.
+    current_epoch = resume["epoch"] + 1
+    steps_in_current_epoch = resume["published_in_epoch"] // controller.dispatch_batch_size
     if start_step > 0:
-        logger.info(f"Resuming from step {start_step} (epoch {current_epoch})")
+        logger.info(
+            f"Resuming from step {start_step} (epoch {current_epoch}, "
+            f"{resume['published_in_epoch']} rows of it already published)"
+        )
     progress = tqdm(total=num_steps, desc="Running Inference", unit="step", initial=start_step)
+
+    save_every = float(getattr(args, "generation_progress_save_seconds", 60.0))
+    next_save = time.monotonic() + save_every
+
+    def _save_progress():
+        controller.save_progress({"completed_steps": completed_steps})
+
+    # PBS sends SIGTERM at walltime and SIGKILL a few seconds later. Turning it
+    # into SystemExit runs the finally below, so the last save is current and
+    # the next job does not republish what this one already sent.
+    previous_sigterm = None
+    if threading.current_thread() is threading.main_thread():
+        def _on_sigterm(signum, frame):
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            logger.warning("SIGTERM received; saving generation progress and exiting")
+            raise SystemExit(128 + signum)
+
+        previous_sigterm = signal.signal(signal.SIGTERM, _on_sigterm)
+
     controller.start_eviction_sweeper()
-    for step in range(start_step, num_steps):
-        is_pipeline_idle = False
-        check_deadline = time.monotonic() + 10
-        while _pipeline_idle():
-            if time.monotonic() > check_deadline:
-                is_pipeline_idle = True
-                logger.info(f"Inference prompt buffer and controller sample pool drained at step {step}")
-                break
-            time.sleep(0.5)
-        begin_next_epoch = steps_in_current_epoch >= steps_per_epoch and completed_steps < num_steps
-        if is_pipeline_idle or begin_next_epoch:
-            current_epoch += 1
-            steps_in_current_epoch = 0
-            logger.info(f"Dataset exhausted, reloading (epoch {current_epoch})...")
-            controller.reload_dataset()
-        deadline = time.monotonic() + 600
-        while not controller.try_dispatch_batch():
-            if time.monotonic() > deadline:
-                raise RuntimeError(
-                    f"Failed to dispatch batch after 600s "
-                    f"(epoch {current_epoch}, step {completed_steps})"
-                )
-            time.sleep(0.05)
-        completed_steps += 1
-        steps_in_current_epoch += 1
-        progress.update(1)
+    try:
+        for step in range(start_step, num_steps):
+            is_pipeline_idle = False
+            check_deadline = time.monotonic() + 10
+            while _pipeline_idle():
+                if time.monotonic() > check_deadline:
+                    is_pipeline_idle = True
+                    logger.info(f"Inference prompt buffer and controller sample pool drained at step {step}")
+                    break
+                time.sleep(0.5)
+            begin_next_epoch = steps_in_current_epoch >= steps_per_epoch and completed_steps < num_steps
+            if is_pipeline_idle or begin_next_epoch:
+                current_epoch += 1
+                steps_in_current_epoch = 0
+                logger.info(f"Dataset exhausted, reloading (epoch {current_epoch})...")
+                controller.reload_dataset()
+            deadline = time.monotonic() + 600
+            while not controller.try_dispatch_batch():
+                if time.monotonic() > deadline:
+                    raise RuntimeError(
+                        f"Failed to dispatch batch after 600s "
+                        f"(epoch {current_epoch}, step {completed_steps})"
+                    )
+                time.sleep(0.05)
+            completed_steps += 1
+            steps_in_current_epoch += 1
+            progress.update(1)
+            if save_every > 0 and time.monotonic() >= next_save:
+                _save_progress()
+                next_save = time.monotonic() + save_every
+    finally:
+        _save_progress()
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
     final_metric_step = int(completed_steps)
     final_metrics = {}

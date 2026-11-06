@@ -21,12 +21,12 @@
 """Training entry point for Eagle3 speculative decoding."""
 
 import argparse
+import asyncio
 import dataclasses
 import os
 import sys
-import time
 import threading
-import asyncio
+import time
 
 # Fix PyTorch 2.9+ TorchInductor GEMM backend regression: without this,
 # FlexAttention backward pass hits NoValidChoicesError and training is 3x slower.
@@ -48,6 +48,10 @@ from torchspec.controller import (
     auto_calculate_training_steps,
     build_mooncake_config,
     run_training_loop,
+)
+from torchspec.controller.generation_progress import (
+    check_progress_file,
+    resolve_progress_path,
 )
 from torchspec.controller.inference_manager import AsyncInferenceManager
 from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
@@ -344,6 +348,12 @@ def train_async_no_generation(args):
     init_tracking(args)
     timer = _InitTimer()
 
+    # [0] Settle the progress file first: refusing to clobber it should not
+    # wait for a multi-minute dataset load.
+    progress_path = resolve_progress_path(args)
+    resume_generation = bool(getattr(args, "resume_generation", False))
+    check_progress_file(progress_path, resume_generation)
+
     # [1] Create controller early (lightweight: only needs args )
     with timer.phase("Create controller"):
         controller = AsyncTrainingController(args)
@@ -356,6 +366,9 @@ def train_async_no_generation(args):
 
     # [3] Wait for dataset sizes (small ints, unlike the old ray.put of the full dataset)
     logger.info(f"Dataset loaded on controller: {dataset_size} train")
+    if progress_path is not None:
+        controller.enable_progress(progress_path, resume=resume_generation)
+        logger.info(f"Generation progress is kept in {progress_path}")
 
     # [4] Continue with initialization sequentially.
     mooncake_master = None
