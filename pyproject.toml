@@ -23,7 +23,9 @@ dependencies = [
     "ninja",
     "packaging",
     "pyzmq",
-    "mooncake-transfer-engine>=0.3.10.post1",
+    # CUDA 13 build (links libcudart.so.13). On a CUDA 12 stack, swap for
+    # mooncake-transfer-engine; see "RDMA failure" in README.md.
+    "mooncake-transfer-engine-cuda13>=0.3.10.post1",
     "openai",
     "omegaconf",
     "ray",

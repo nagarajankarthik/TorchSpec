@@ -9,11 +9,15 @@
 #SBATCH --output=/mnt/weka/aisg/users/karthik/model_training_team/TorchSpec/logs/%j.log
 
 #PBS -N torchspec_infer
-#PBS -l select=1:ncpus=64:ngpus=4
+# mem must be explicit: the PBS server default is 10mb, and the Mooncake
+# segment alone pins 256GB of host memory.
+#PBS -l select=1:ngpus=8:ncpus=128:mem=1900gb
 #PBS -l walltime=24:00:00
+#PBS -k oed
 #PBS -j oe
-#PBS -q AISG_debug
-#PBS -o /scratch_aisg/scratch_aisg/karthik/model_training_team/TorchSpec/logs/
+#PBS -P 12004500
+#PBS -q normal
+#PBS -o /data/projects/12004500/karthik/TorchSpec/logs/
 
 source ~/.bashrc
 set -x
@@ -45,12 +49,24 @@ CONFIG_FILE="${1:-${BASE_DIR}/TorchSpec/custom_scripts/vllm_aisg_qwen3p5_397b_fl
 
 export LOG_DIR="${BASE_DIR}/TorchSpec/logs/${JOB_ID}"
 mkdir -p $LOG_DIR
-export MOONCAKE_MASTER_SERVER_ADDRESS="${MASTER_ADDR}"
 export MOONCAKE_ENV_FILE="${BASE_DIR}/TorchSpec/logs/${JOB_ID}/mooncake_env.sh"
 
-LOCAL_IP=$(hostname -I | awk '{print $1}')
+# Aspire 2B. Also set protocol to tcp and remove device_name in mooncake section of config file.
+# GPU nodes are Slingshot-only; 'hostname -I' and the node hostname both resolve
+# to bond0, a 1GbE management port, so advertise hsn0 instead.
+LOCAL_IP=$(ip -4 -o addr show hsn0 | awk '{print $4}' | cut -d/ -f1)
 if [[ -z "${LOCAL_IP}" ]]; then
-    echo "ERROR: could not determine a local IP from 'hostname -I'" >&2
+    echo "ERROR: could not determine an IPv4 address on hsn0" >&2
+    exit 1
+fi
+# Single-node job: the master runs here, so reach it over hsn0 too.
+export MOONCAKE_MASTER_SERVER_ADDRESS="${LOCAL_IP}"
+
+# Redis is installed per-user and may not be on PATH; override with
+# REDIS_SERVER=/path/to/redis-server. Checked before anything is started.
+REDIS_SERVER="${REDIS_SERVER:-$(command -v redis-server)}"
+if [[ ! -x "${REDIS_SERVER}" ]]; then
+    echo "ERROR: redis-server not found; set REDIS_SERVER or add it to PATH" >&2
     exit 1
 fi
 
@@ -77,7 +93,7 @@ until timeout 1 bash -c '</dev/tcp/localhost/8011' && timeout 1 bash -c '</dev/t
 done
 
 # Launch Redis server
-redis-server --port 6390 --bind 0.0.0.0 --protected-mode no \
+"${REDIS_SERVER}" --port 6390 --bind "${LOCAL_IP}" 127.0.0.1 --protected-mode no \
              --save '' --appendonly no \
              --maxmemory 2gb --maxmemory-policy noeviction &
 REDIS_PID=$!
@@ -160,6 +176,23 @@ until curl -s http://localhost:8080/health > /dev/null; do
     sleep 5
 done
 echo "vLLM server is ready!"
+
+# Pre-read the training data into the page cache. /data is Lustre, and the
+# dataset is mmapped by load_from_disk, so the loader otherwise pulls it in
+# through small page faults (~300 rows/s, hours for 2.2M rows). Large parallel
+# sequential reads run at full Lustre bandwidth and make the loader ~30x faster.
+# This runs after vLLM is up so it does not compete with the weight load.
+TRAIN_DATA_PATH=$(${BASE_DIR}/uv_biome/torchspec/bin/python3 -c \
+    'import sys, yaml; print(yaml.safe_load(open(sys.argv[1]))["dataset"]["train_data_path"] or "")' \
+    "$CONFIG_FILE")
+if [[ -d "${TRAIN_DATA_PATH}" ]]; then
+    echo "Pre-reading ${TRAIN_DATA_PATH} into page cache..."
+    PREREAD_START=${SECONDS}
+    find "${TRAIN_DATA_PATH}" -name '*.arrow' -print0 | xargs -0 -P 16 -n 8 cat > /dev/null
+    echo "Pre-read finished in $(( SECONDS - PREREAD_START ))s."
+else
+    echo "WARNING: train_data_path '${TRAIN_DATA_PATH}' is not a local directory; skipping pre-read." >&2
+fi
 
 
 ${BASE_DIR}/uv_biome/torchspec/bin/python3 -m torchspec.train_entry \

@@ -255,16 +255,23 @@ class MooncakeHiddenStateStore(ABC):
                 "Mooncake version too old: batch_remove() not found. "
                 "Requires mooncake-transfer-engine >= 0.3.10.post1."
             )
-        try:
-            from importlib.metadata import version
+        from importlib.metadata import PackageNotFoundError, version
 
-            from packaging.version import Version
+        from packaging.version import Version
 
-            installed = Version(version("mooncake-transfer-engine"))
-            if installed >= Version("0.3.10.post1"):
-                return
-        except Exception:
-            pass
+        # The CUDA-specific wheels ship the same mooncake module under
+        # different distribution names.
+        for dist in (
+            "mooncake-transfer-engine-cuda13",
+            "mooncake-transfer-engine",
+        ):
+            try:
+                if Version(version(dist)) >= Version("0.3.10.post1"):
+                    return
+            except PackageNotFoundError:
+                continue
+            except Exception:
+                break
         doc = getattr(batch_remove, "__doc__", "") or ""
         if "force" not in doc:
             raise RuntimeError(

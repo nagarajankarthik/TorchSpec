@@ -265,7 +265,7 @@ Current Mooncake version has a bug with TCP-only hosts causing a SEGFAULT error.
 
 ### RDMA failure
 
-If you get the error `... libcudart symbols not found globally. Make sure PyTorch with CUDA is installed before using TileLang`, reinstall mooncake to match your system CUDA version, i.e. if you run on CUDA 13, mooncake is probably installed for cu12 wheels, re-install it using `uv pip uninstall mooncake-transfer-engine && uv pip install mooncake-transfer-engine-cuda13`.
+If you get the error `... libcudart symbols not found globally. Make sure PyTorch with CUDA is installed before using TileLang`, reinstall mooncake to match your system CUDA version. The project depends on the CUDA 13 build (`mooncake-transfer-engine-cuda13`); if you run on CUDA 12, re-install it using `uv pip uninstall mooncake-transfer-engine-cuda13 && uv pip install mooncake-transfer-engine`.
 
 ### Per-Rank File Logging
 
