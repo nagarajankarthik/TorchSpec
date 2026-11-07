@@ -183,6 +183,9 @@ try:
                 *args,
                 **kwargs,
             ):
+                if module_hash is None:
+                    # CUTLASS DSL >= 4.8 skips hashing when the caller asked for no_cache.
+                    module_hash = self.get_module_hash(module, function_name)
                 return _orig_compile_and_cache(
                     self,
                     module,
