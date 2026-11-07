@@ -61,6 +61,14 @@ if [[ -z "${LOCAL_IP}" ]]; then
 fi
 # Single-node job: the master runs here, so reach it over hsn0 too.
 export MOONCAKE_MASTER_SERVER_ADDRESS="${LOCAL_IP}"
+# Mooncake's TCP transport ignores local_hostname when it advertises its data
+# address: it picks the first UP interface, which is bond0 (1GbE). Consumers then
+# read every sample at ~0.12 GB/s and hit LEASE_EXPIRED / TRANSFER_FAIL. Pin it
+# to hsn0 (~4.4 GB/s per reader). More I/O threads lift 8-way reads from ~4.9
+# to ~14 GB/s. Inherited by the vLLM workers, one of which owns the segment.
+# Exported here, not written to MOONCAKE_ENV_FILE: consumers must bind their own IP.
+export MC_TCP_BIND_ADDRESS="${LOCAL_IP}"
+export MC_NUM_TCP_IO_THREADS=8
 
 # Redis is installed per-user and may not be on PATH; override with
 # REDIS_SERVER=/path/to/redis-server. Checked before anything is started.
