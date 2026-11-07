@@ -115,7 +115,16 @@ def parse_config(save_snapshot: bool = True):
     """
 
     parser = argparse.ArgumentParser(description="Eagle3 speculative decoding training")
-    parser.add_argument("--config", "-c", type=str, required=True, help="Path to YAML config")
+    # Repeatable rather than nargs="+": unknown args are dotlist overrides, and
+    # nargs="+" would swallow "--config a.yaml mooncake.x=y" as two files.
+    parser.add_argument(
+        "--config",
+        "-c",
+        type=str,
+        action="append",
+        required=True,
+        help="Path to YAML config; repeat to merge several, later files win",
+    )
     parser.add_argument(
         "--print-config-only", action="store_true", help="Print resolved config and exit"
     )
@@ -126,7 +135,7 @@ def parse_config(save_snapshot: bool = True):
         config_path=args.config, cli_args=unknown if unknown else None, save_snapshot=save_snapshot
     )
 
-    logger.info("Resolved config:\n%s", OmegaConf.to_yaml(config))
+    logger.info("Resolved config:\n%s", OmegaConf.to_yaml(config, resolve=True))
 
     if args.print_config_only:
         sys.exit(0)

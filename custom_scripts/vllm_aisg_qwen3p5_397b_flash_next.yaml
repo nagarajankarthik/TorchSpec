@@ -1,6 +1,6 @@
 
 dataset:
-  train_data_path: /mnt/weka/aisg/users/karthik/model_training_team/data_bank/aisg_qwen3p5_397b_a17b_flash_next_train
+  train_data_path: ${oc.env:BASE_DIR}/data_bank/aisg_qwen3p5_397b_a17b_flash_next_train
   eval_data_path: null
   eval_interval: 1000
   # chat_template is not used for 
@@ -26,26 +26,24 @@ inference:
   # Post-layer semantics. launch.sh must pass [id + 1 for id in this list] plus
   # the model's num_hidden_layers (60) as eagle_aux_hidden_state_layer_ids,
   # len(this list) must equal mooncake.num_aux_layers.
-  aux_hidden_states_layers: [1, 9, 17, 25, 33, 41, 49, 57]
+  aux_hidden_states_layers: [1, 33, 57]
 
   vllm:
     endpoints: ["http://127.0.0.1:8080"]
     timeout_s: 1800.0
 
 mooncake:
-  protocol: rdma
-  # TODO: Verify this by running ibv_devinfo
-  device_name: mlx5_0
+  # protocol and device_name are cluster-specific: see clusters/<CLUSTER_NAME>.yaml.
   hidden_dim: 4096
   max_seq_len: 16384
-  num_aux_layers: 8
+  num_aux_layers: 3
   global_segment_size: 256GB
   local_buffer_size: 8GB
   master_server_address: null
   master_port: 8011
   metadata_server: null
   metadata_port: 8012
-  # Must match --metrics_port in launch.sh; the controller scrapes it for backpressure.
+  # Must match TS_MOONCAKE_METRICS_PORT in common/services.sh; the controller scrapes it for backpressure.
   metrics_port: 8013
   # Pause generation at this fraction of master capacity. Must stay below the
   # master's own eviction_high_watermark_ratio (0.90), which drops unread objects.
@@ -64,7 +62,7 @@ redis:
   publish_retry_seconds: 2
   # Must exceed watermark * global_segment_size / bytes_per_shortest_sample,
   # i.e. the most samples Mooncake can hold at once. Checked at startup.
-  stream_maxlen: 32768
+  stream_maxlen: 65536
   min_expected_seq_len: 128
   heartbeat_seconds: 10.0
   train_stream: "train_samples"

@@ -378,11 +378,17 @@ def _save_config_snapshot(config: DictConfig) -> None:
 
 
 def load_config(
-    config_path: Optional[str] = None,
+    config_path: str | list[str] | None = None,
     cli_args: Optional[list] = None,
     base_config: Optional[DictConfig] = None,
     save_snapshot: bool = False,
 ) -> DictConfig:
+    """Merge schema, base_config, each YAML in ``config_path`` (in order), then cli_args.
+
+    Later files override earlier ones key by key, e.g. a model config followed by
+    a cluster config that only sets ``mooncake.protocol``. Relative data paths in
+    each file resolve against that file's own directory.
+    """
     schema = OmegaConf.structured(Config)
 
     configs_to_merge = [schema]
@@ -390,11 +396,12 @@ def load_config(
     if base_config is not None:
         configs_to_merge.append(base_config)
 
-    if config_path is not None:
-        file_config = OmegaConf.load(config_path)
+    config_paths = [config_path] if isinstance(config_path, str) else list(config_path or [])
+    for path in config_paths:
+        file_config = OmegaConf.load(path)
         _resolve_relative_paths(
             file_config,
-            os.path.dirname(os.path.abspath(config_path)),
+            os.path.dirname(os.path.abspath(path)),
             skip_keys=frozenset(_ALWAYS_LOCAL_PATH_KEYS),
         )
         configs_to_merge.append(file_config)
@@ -494,7 +501,9 @@ def config_to_flat_args(config: DictConfig) -> argparse.Namespace:
 
 
 def save_config(config: DictConfig, path: str) -> None:
-    OmegaConf.save(config, path)
+    # resolve=True: record the values this run used (e.g. the expanded
+    # ${oc.env:BASE_DIR}), not interpolations that depend on the next shell.
+    OmegaConf.save(config, path, resolve=True)
 
 
 def print_config(config: DictConfig) -> None:

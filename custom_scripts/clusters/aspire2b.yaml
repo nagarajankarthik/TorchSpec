@@ -1,0 +1,8 @@
+# Merged after the model config: train_entry --config <model>.yaml --config aspire2b.yaml.
+# Only keys that differ between clusters belong here.
+mooncake:
+  # Slingshot-only nodes (Cassini/CXI, no verbs), and the PyPI Mooncake wheels
+  # are not built with USE_CXI, so rdma is unavailable. tcp runs over hsn0;
+  # aspire2b.env.sh pins the advertised address with MC_TCP_BIND_ADDRESS.
+  protocol: tcp
+  device_name: ""

@@ -1,0 +1,6 @@
+# Merged after the model config: train_entry --config <model>.yaml --config smc.yaml.
+# Only keys that differ between clusters belong here.
+mooncake:
+  protocol: rdma
+  # TODO: Verify this by running ibv_devinfo
+  device_name: mlx5_0

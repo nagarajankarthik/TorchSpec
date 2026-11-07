@@ -9,14 +9,68 @@ runs `torchspec.train_entry` against that endpoint.
 |---|---|---|
 | `launch_ornith_1p5_397b.sh` | `vllm_ornith_1p5_397b.yaml` | `ornith-ai/Ornith-1.5-397B` |
 | `launch_nemotron_3_super_120b.sh` | `vllm_nemotron_3_super_120b.yaml` | `aisingapore/Nemotron-SEA-LION-v5-120B-A12B` |
+| `launch_aisg_qwen3p5_397b_a17b_flash_next.sh` | `vllm_aisg_qwen3p5_397b_flash_next.yaml` | `aisingapore/Qwen3.5-397B-A17B-FlashNext-Prewarm-Exp-2` |
 
 This file holds the reasoning behind flag choices that are not self-evident from
 the scripts. Measurements are recorded with the job IDs that produced them;
 treat them as data, not as theory to be re-derived.
 
+## Clusters
+
+Every script runs on every cluster. What differs between clusters is kept out
+of the scripts and model configs:
+
+```
+clusters/<name>.env.sh   network (LOCAL_IP, master address), Mooncake transport
+                         env vars, module loads, PREREAD_TRAIN_DATA
+clusters/<name>.yaml     config keys merged after the model config
+                         (mooncake.protocol, mooncake.device_name)
+common/services.sh       shared startup: Mooncake env + master, Redis, vLLM
+                         health wait, dataset pre-read, train_entry
+```
+
+`<name>` comes from `CLUSTER_NAME`, exported in `~/.bashrc` on each cluster
+(`aspire2b` or `smc`). A launch script stops immediately if it is unset or has no
+matching files. Override it for one job with `qsub -v CLUSTER_NAME=...` or
+`sbatch --export=ALL,CLUSTER_NAME=...`; that works because `~/.bashrc` uses
+`export CLUSTER_NAME=${CLUSTER_NAME:-<default>}`.
+
+The model config and cluster config are merged in that order, so a cluster file
+only overrides the keys it sets:
+
+```
+train_entry --config vllm_<model>.yaml --config clusters/<name>.yaml key=value ...
+```
+
+Dataset paths are written as `${oc.env:BASE_DIR}/data_bank/...`, which holds
+on both clusters, so they stay in the model config.
+
+Check what a script will do without starting anything (outside a job, preset
+`LOCAL_IP`; the login node has no `hsn0`):
+
+```
+DRY_RUN=1 LOCAL_IP=10.180.4.99 bash custom_scripts/launch_<model>.sh
+```
+
+The `#SBATCH` and `#PBS` headers are both kept in each script, and each
+scheduler ignores the other's. This relies on SMC being the only Slurm cluster
+and ASPIRE 2B the only PBS one.
+
+### ASPIRE 2B
+
+GPU nodes are Slingshot-only (Cassini/CXI, no verbs), and the PyPI Mooncake
+wheels lack CXI support, so Mooncake runs `tcp` over `hsn0`. Mooncake's TCP
+transport advertises the first UP interface (`bond0`, 1GbE) as its data address
+regardless of `local_hostname`; `aspire2b.env.sh` pins it with
+`MC_TCP_BIND_ADDRESS`. Without that, consumer reads ran at ~0.12 GB/s and failed
+with `LEASE_EXPIRED` / `TRANSFER_FAIL` (producer job 240971, consumers
+241032-241038). With it: ~4.4 GB/s per reader, ~14 GB/s for 8 concurrent
+readers with `MC_NUM_TCP_IO_THREADS=8`. Consumers on ASPIRE 2B should set both
+variables to their own `hsn0` address.
+
 ## Aux hidden-state layer IDs
 
-Applies to both scripts. The same note lives in
+Applies to every script. The same note lives in
 `torchspec/inference/engine/vllm_engine.py`.
 
 Layer IDs use **post-layer semantics**: "capture the residual stream after layer
